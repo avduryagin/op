@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 import time
-from optim import op
+import op
 import calendar
 
 
@@ -150,6 +150,7 @@ class wells_schedule:
         self.queue=dict({}) #словарь с значениями key - номер скважины, value -
         self.vector = np.array([],dtype=bool) #вектор состояния скважин для бригады. True - значение конечное
         self.tracing=False
+        self.permutation=False
         self.t=100 #время на проведение мероприятий
         self.debit_functions=dict({})
         self.epsilon=np.inf
@@ -167,7 +168,8 @@ class wells_schedule:
         self.end=None
         self.wtime=0
         self.used=None
-    def fit(self,ts,tr,Q0,Q1,current_places,support=None,queue=dict({}),wells_allowed=None,groups_allowed=None, tracing=None,epsilon=np.inf,delta=3,stop=None):
+
+    def fit(self,ts,tr,Q0,Q1,current_places,support=None,queue=dict({}),wells_allowed=None,groups_allowed=None, tracing=None, permutation=None, epsilon=np.inf,delta=3,stop=None):
         def update_df():
             if self.routes is not None:
                 for i in np.arange(self.routes.shape[1]):
@@ -199,6 +201,8 @@ class wells_schedule:
         #used - булев массив размерности groups. True - индекс бригады, размещенной на скважине для ремонта. False - бригада на скважине, но на работу не назначена.
         if (tracing is not None) and isinstance(tracing,bool):
             self.tracing=tracing
+        if (permutation is not None) and isinstance(permutation, bool):
+            self.permutation = permutation
         self.Q1=Q1
         self.Q0=Q0
         self.dQ=self.Q1-self.Q0
@@ -229,6 +233,7 @@ class wells_schedule:
         self.st=np.zeros(self.groups.shape[0],dtype=np.float16)
         self.dt = np.zeros(self.groups.shape[0],dtype=np.float16)
         self.current_index = np.zeros(self.groups.shape[0],dtype=np.int32)
+        self.current_indey = np.arange(self.groups.shape[0])#координата в столбце self.routes
         self.numbers = np.arange(self.groups.shape[0])
         #устанавливаем начальное время для бригад на скважинах
         set_initial_time()
@@ -611,28 +616,166 @@ class wells_schedule:
         return None
 
 
-    def get_span(self, i=0):
+    def get_span(self, i=0,mode='span'):
 
         if self.routes is None:
             return np.inf, np.inf
         if i >= self.routes.shape[1]:
             return np.NINF, np.inf
 
+
         ci = self.current_index[i]
+        yci=self.current_indey[i]
 
         if ci >= self.routes.shape[0]:
             return np.NINF, np.inf
 
-        target = self.routes[ci, i]
+        target = self.routes[ci, yci]
 
         if target < 0:
             return np.NINF, np.inf
 
-        t1=self.debit_functions[target].span[0]
-        t2 =self.debit_functions[target].span[1]
+        if mode=='span':
+            t1=self.debit_functions[target].span[0]
+            t2 =self.debit_functions[target].span[1]
+        elif mode=='time':
+            t1=self.debit_functions[target].t1
+            t2 =self.debit_functions[target].t2
+        else:
+            t1=np.NINF
+            t2=np.inf
+
 
 
         return t1, t2
+
+    def get_route_weigths_v1(self) -> (np.array,np.array):
+        index_=[]
+        mask=np.where(self.current_index<self.routes.shape[0])[0]
+        for m in mask:
+            if self.routes[self.current_index[m],self.current_indey[m]]>=0:
+                index_.append(m)
+        index=np.array(index_)
+        if index.shape[0]==0:
+            return (index,index)
+
+        #index=np.where(self.routes[self.current_index[mask],self.current_indey[mask]]>=0)[0]
+        weigth=np.empty(shape=(index.shape[0],index.shape[0]))
+        mask=np.zeros(index.shape[0],dtype=bool)
+        notinf=np.zeros(index.shape[0],dtype=np.int16)
+        #weigth.fill(np.NINF)
+        weigth.fill(np.inf)
+
+        i_=0
+
+        while i_<index.shape[0]:
+            i=index[i_]
+            cw=self.groups[i]
+            ct=self.ct[i]
+            j_=0
+            isinf=True
+            while j_ < index.shape[0]:
+                j=index[j_]
+                ci=self.current_index[j]
+                yci=self.current_indey[j]
+                t1_,t2_=self.get_span(j)
+                if ~np.isinf(t2_):
+
+                    target=self.routes[ci,yci]
+                    free_ = self.isprohibited(ct, target)
+                    if (target>=0) and self.ftmatrix[target,j] and free_:
+                        #value=t2_-ct-self.ts[cw,target]
+                        value=t1_-ct-self.ts[cw,target]
+                        if ~mask[i_]:
+                            mask[i_]=True
+                            notinf[i_]=j_
+                            isinf=False
+
+                        if value>t2_:
+                            value=np.inf
+                    else:
+                        value=np.inf
+                    weigth[i_, j_] = value
+                j_+=1
+            if isinf:
+                weigth[i_, i_]=np.NINF
+                mask[i_]=True
+                notinf[i_] = i_
+
+
+
+            i_+=1
+        indices=notinf[mask]
+        weigth_=weigth[indices,:][:,indices]
+
+        #if weigth_.shape[0]!=weigth_.shape[1]:
+            #print()
+
+        return (weigth_,indices)
+
+    def get_route_weigths(self) -> (np.array,np.array):
+        index_=[]
+        mask=np.where(self.current_index<self.routes.shape[0])[0]
+        for m in mask:
+            if self.routes[self.current_index[m],self.current_indey[m]]>=0:
+                index_.append(m)
+        index=np.array(index_)
+        if index.shape[0]==0:
+            return (index,index)
+
+        #index=np.where(self.routes[self.current_index[mask],self.current_indey[mask]]>=0)[0]
+        weigth=np.empty(shape=(index.shape[0],index.shape[0]))
+        mask=np.zeros(index.shape[0],dtype=bool)
+        notinf=np.zeros(index.shape[0],dtype=np.int16)
+        #weigth.fill(np.NINF)
+        weigth.fill(np.inf)
+
+        i_=0
+
+        while i_<index.shape[0]:
+            i=index[i_]
+            cw=self.groups[i]
+            ct=self.ct[i]
+            j_=0
+            isinf=True
+            while j_ < index.shape[0]:
+                j=index[j_]
+                ci=self.current_index[j]
+                yci=self.current_indey[j]
+                t1_,t2_=self.get_span(j)
+                if ~np.isinf(t2_):
+
+                    target=self.routes[ci,yci]
+                    free_ = self.isprohibited(ct, target)
+                    if (target>=0) and self.ftmatrix[target,j] and free_:
+                        #value=t2_-ct-self.ts[cw,target]
+                        value=t1_-ct-self.ts[cw,target]
+                        if (~mask[j_])&isinf:
+                            mask[j_]=True
+                            notinf[j_]=i_
+                            isinf=False
+
+                        if value>t2_:
+                            value=np.inf
+                    else:
+                        value=np.inf
+                    weigth[i_, j_] = value
+                j_+=1
+            if isinf:
+                weigth[i_, i_]=np.NINF
+                mask[i_]=True
+                notinf[i_] = i_
+
+
+
+            i_+=1
+        indices=notinf[mask]
+        weigth_=weigth[indices,:][:,indices]
+
+        #if weigth_.shape[0]!=weigth_.shape[1]:
+            #print()
+
+        return (weigth_,indices)
 
     def get_span_v1(self,i=0):
 
@@ -686,6 +829,7 @@ class wells_schedule:
             return np.NINF, np.inf
 
         target = self.routes[ci, i]
+
 
         if target<0:
             return np.NINF, np.inf
@@ -763,6 +907,7 @@ class wells_schedule:
     def get_vector(self, i=0, array=True):
         values = []
         cw = self.groups[i]
+
         k = 0
         inf = True
         # i- индекс бригады
@@ -772,13 +917,19 @@ class wells_schedule:
         cv = np.inf
         dt = 0.
         ck = None
+        #teta = np.where(self.free == 25)[0]
         self.vector=np.zeros(shape=self.stop,dtype=bool)
         # fun()
         if ~np.isinf(a_):
             # wi- индекс следующей по расписанию скважины
             # next_well- номер следующей по расписанию скважины
             wi = self.current_index[i]
-            next_well = self.routes[wi, i]
+            yci = self.current_indey[i]
+            next_well = self.routes[wi, yci]
+            #if (cw==156)&(next_well==56):
+                #print()
+
+            #print('i=',i,' next=', next_well)
 
         while k < self.stop:
             j = self.free[k]
@@ -791,10 +942,10 @@ class wells_schedule:
                 x=self.set_bound(x,func)
 
             x=self.get_group_support(x,i)
-            t1=time.perf_counter()
+            #t1=time.perf_counter()
             free_=self.isprohibited(x,j)
-            t2 = time.perf_counter()
-            self.wtime+=(t2-t1)
+            #t2 = time.perf_counter()
+            #self.wtime+=(t2-t1)
 
             if (self.ftmatrix[j,i])& free_:
 
@@ -804,6 +955,8 @@ class wells_schedule:
                     if j == next_well:
                         ck = k
                         dt = a_ - x
+                        if dt<0:
+                            dt=0
 
                         value = fun(fun=func, x=x)
 
@@ -905,13 +1058,17 @@ class wells_schedule:
                     # wi- индекс следующей по расписанию скважины
                     # next_well- номер следующей по расписанию скважины
                     wi = self.current_index[k]
-                    next_well = self.routes[wi, k]
+                    yci = self.current_indey[k]
+                    next_well = self.routes[wi, yci]
 
 
                 if next_well is not None:
                     if cw == next_well:
                         ck = k
                         dt = a_ - x
+                        if dt<0:
+                            dt=0
+
                         nw = next_well
                         value = fun(fun=func, x=x)
                     else:
@@ -1174,6 +1331,28 @@ class wells_schedule:
 
     def get_optimized_trajectories(self,indices=np.array([0])):
         #t1 = time.perf_counter()
+        #i_=15
+        if (not self.tracing) & self.permutation:
+            #w1=self.routes[self.current_index[i_],self.current_indey[i_]]
+            #if w1==56:
+                #print()
+            #print(self.routes[self.current_index[i_],self.current_indey[i_]])
+            weigth,sindex=self.get_route_weigths()
+            #for tet in np.arange(weigth.shape[0]):
+                #val=weigth[tet,tet]
+                #if np.isinf(val):
+                    #print()
+            #li_=np.where(sindex==i_)[0][0]
+            if weigth.shape[0]>0:
+                localswap, s = self.function(weigth, criterion='min', engine=self.engine)
+                swap=sindex[localswap[1]]
+                self.current_index[sindex]=self.current_index[swap]
+                self.current_indey[sindex] = self.current_indey[swap]
+            #w2=self.routes[self.current_index[i_],self.current_indey[i_]]
+
+            #print('cpl',self.groups[i_],w1,'-->',w2,' wigth=',weigth[li_,sli_],"ct",self.ct[i_],"st",self.st[i_],'shape',weigth.shape)
+
+
         vectors=self.get_weights(indices=indices)
         #t2 = time.perf_counter()
         #self.wtime += (t2-t1)
@@ -1181,13 +1360,7 @@ class wells_schedule:
             return None
 
         try:
-            #numbers=np.zeros(shape=vectors.shape[0],dtype=np.int16)
-            #s=self.function(vectors,numbers)
-            #taken=np.vstack((np.arange(numbers.shape[0]),numbers))
-
             taken,s=self.function(vectors,criterion='max',engine=self.engine)
-            #self.wtime+=s
-
 
         except (IndexError):
             return None
@@ -1205,6 +1378,10 @@ class wells_schedule:
 
         if self.transpose:
             self.transpose = False
+
+        #print(self.free.shape)
+        #print('-----------------------')
+
 
         return taken,s
 
@@ -1369,10 +1546,12 @@ class wells_schedule:
             k=0
             for i in self.nempty:
                 ci=self.current_index[i]
-                well=self.routes[ci,i]
-                taken=index[k]
-                if taken==well:
-                    self.current_index[i]=ci+1
+                yci = self.current_indey[i]
+                if ci<self.routes.shape[0]:
+                    well=self.routes[ci,yci]
+                    taken=index[k]
+                    if taken==well:
+                        self.current_index[i]=ci+1
                 k+=1
 
     def update_queue(self,w=0,i=None):
