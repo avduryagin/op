@@ -775,7 +775,7 @@ class wells_schedule:
         #if weigth_.shape[0]!=weigth_.shape[1]:
             #print()
 
-        return (weigth_,indices)
+        return (weigth_,index[indices])
 
     def get_span_v1(self,i=0):
 
