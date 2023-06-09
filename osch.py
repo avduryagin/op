@@ -1,11 +1,20 @@
+import os
+import pickle
+
+import cppmath
 import numpy as np
 import pandas as pd
 import time
 import op
 import calendar
+import dbsessions as db
 
 
 path='D:\\ml\\'
+
+def dts(x=0):
+    return int(x*86400)
+
 
 def reverse(x=np.array([])):
     n=int(x.shape[0]/2)
@@ -35,6 +44,52 @@ class queues:
             return x
         except IndexError:
             return None
+class Executor:
+    def __init__(self):
+        self.index=0
+        self.corteges=np.ma.array(data=[],mask=[])
+        self.indices=dict({})
+        self.epsilon=np.inf
+        self.injected=False
+        self.paused=False
+        self.tau_horizon=np.inf
+    def loc(self,item):
+        i=self.indices[item]
+        return self.iloc(i)
+
+    def iloc(self,item):
+        try:
+            return self.corteges.mask[item]
+        except IndexError:
+            return None
+    def apply(self,item):
+        try:
+            i = self.indices[item]
+            self.corteges.mask[i]=True
+        except KeyError:
+            pass
+    def getitems(self):
+        return self.corteges[~self.corteges.mask].data
+    def isempty(self):
+        if self.corteges[~self.corteges.mask].shape[0]>0:
+            return False
+        else: return True
+
+    def add(self,value):
+        n=self.corteges.shape[0]
+        self.indices[value]=n
+        if n==0:
+            data=[]
+            mask=[]
+        else:
+            data=list(self.corteges.data)
+            mask=list(self.corteges.mask)
+        data.append(value)
+        mask.append(False)
+        self.corteges=np.ma.array(data,mask=mask)
+
+
+
 
 class debit_function:
     def __init__(self,q0=1,q1=1,tau=0,t=0):
@@ -50,10 +105,13 @@ class debit_function:
         self.supp=np.array((0,self.t),dtype=np.float32)
         #self.cs -compact support
         self.cs=False
+        self.opened=False
+        self.reserved=False
         self.index=0
         self.current_index = 0
+        self.cortege=None
         self.order=0
-        self.gamma=0.01
+        self.gamma=10
         self.epsilon=tau
         self.service=np.array([],dtype=np.int32)
         self.equipment = np.array([], dtype=np.int32)
@@ -62,14 +120,26 @@ class debit_function:
         self.t2=np.NINF
         self.x1=np.NINF #временные координаты входа/выхода
         self.x2=np.NINF
-        self.span=(np.NINF,np.inf)
+        self.span=np.array([np.NINF,np.inf])
         self.key=None
         self.used=False
+        self.usedby=None
         self.prohibits=np.array([],dtype=np.int16)
         self.bounds=dict({})
         if self.dq<0:
             self.ro=0
         self.drift=self.b*self.ro+self.teta*(1-self.ro)
+        self.dt=0
+        self.master=True
+        self.left_slave=None
+        self.right_slave=None
+
+    def reset_cortege(self):
+        self.supp=np.array((0,self.t),dtype=np.float32)
+        self.cs=False
+        self.opened=False
+        self.reserved=False
+        #self.cortege=None
 
     def isbusy(self,x):
         if (x>=self.t1)&(x<=self.t2):
@@ -85,11 +155,11 @@ class debit_function:
         b=self.t-self.tau
         a=b-self.epsilon
         w=self.scaled_v1(a)
-        if x>a:
-            y=(a-x)/(b-x)
-            return w+w*((1./np.exp(-self.gamma*y**2))-1)
+        if (x>=a)&(x<=b):
+            y=(x-a)/(b-x)
+            return w+(1./np.exp(-self.gamma*y**2))-1
         elif x>b:
-            return np.inf
+            return np.NINF
         else:
             return self.scaled_v1(x)
 
@@ -114,6 +184,885 @@ class debit_function:
         if self.dq<0:
             self.ro=0
 
+
+class Engineering:
+    def __init__(self,*args,**kwargs):
+
+        self.compatibility=np.array([])
+        self.pair_diction=self.PairsDict()
+        self.Q0=np.array([],dtype=np.float64)
+        self.Q1 = np.array([],dtype=np.float64)
+        self.duration=np.array([],dtype=np.float64)
+        self.support=np.array([],dtype=np.float64).reshape(-1,2)
+        #self.acmatrix=np.array([],dtype=bool)
+        self.ftmatrix = ListedDicts(value=False,reverse=True)
+        self.blocks=np.ones([],dtype=bool)
+        #self.ts=RMListedDicts(value=0)
+        self.ts = RMListedDicts_py(value=0)
+        self.used = np.zeros([], dtype=bool)
+        self.roadmap=ListedDicts(value=False,reverse=True)
+        self.session=None
+        self.activities=None
+        self.executors = None
+        self.unique_values=dict({})
+        self.ufields=['id','well','object_type','well_pad_id','act_type','field_id','shop_id','enterprise_id']
+        self.executor_index = None
+        self.activity_index = None
+        self.time_scale=1./(24*60*60)
+        self.begin=np.datetime64('2022-01-01')
+        self.end=np.datetime64('2023-03-01')
+        self.global_duration=(self.end-self.begin)/np.timedelta64(1,'D')
+        self.corteges=dict({})
+        self.corteges_index=np.array([])
+        self.corteges_position=np.array([])
+
+    def open_session(self,*args,**kwargs):
+        self.session = db.Session(*args,**kwargs)
+        self.session.open()
+
+    def get_activities(self,*args,**kwargs):
+        def get_unique(field='id',include_nan=False):
+            if not include_nan:
+                try:
+                    mask=~np.isnan(self.activities[field].values)
+                except TypeError:
+                    mask = ~self.activities[field].isnull()
+                uvalues = np.unique(self.activities.loc[mask, field].values)
+            else:
+                uvalues = np.unique(self.activities.loc[:,field].values)
+            return tuple(uvalues)
+
+        if self.session is None:
+            self.open_session()
+
+        self.activities=self.session.get_activities(*args,**kwargs)
+        self.support=(self.activities[['supp0','supp1']].values-self.begin)/np.timedelta64(1,'D')
+        mask=np.where(~np.isnan(self.support[:,0]) & np.isnan(self.support[:,1]))
+        self.support[mask,1]=self.global_duration
+        self.Q0=self.activities['Q0'].values
+        self.Q1 = self.activities['Q1'].values
+        mask=np.where(np.isnan(self.Q0))[0]
+        self.Q0[mask]=0.
+        mask=np.where(np.isnan(self.Q1))[0]
+        self.Q1[mask]=0.
+        #mask = np.where(np.isnan(self.activities['duration'].values))[0]
+        self.duration=(self.activities['plan_end']-self.activities['plan_begin'])/np.timedelta64(1,'D')
+        self.activities.loc[:,'duration']=self.duration
+        #self.duration[mask]=0
+
+
+
+        for c in self.ufields:
+            values_= get_unique(field=c)
+            self.unique_values.update({c:values_})
+        self.get_corteges()
+
+    def get_corteges(self):
+        def get_pos(corteges_position,corteges_index):
+            uniq=np.unique(corteges_index)
+            corteges_position_ = np.empty(corteges_position.shape[0])
+            corteges_position_.fill(np.nan)
+            for c in uniq:
+                if np.isnan(c):
+                    continue
+                mask = np.where(corteges_index == c)[0]
+                pos = corteges_position[mask]
+                minpos = pos.min()
+                corteges_position_[mask] = pos - minpos
+            return corteges_position_
+        empty_mask=self.activities['from_end'].isnull()
+        self.activities['begin_to']=self.activities['begin_to']*self.time_scale
+        self.activities['begin_from'] = self.activities['begin_from'] * self.time_scale
+        self.activities.loc[empty_mask,'from_end']=0
+        self.corteges_index=self.activities['cortege_activity_id'].values
+        corteges_position = self.activities['position'].values
+        self.corteges_position=get_pos(corteges_position,self.corteges_index)
+        self.activities['native_position']=self.activities['position']
+        self.activities['position']=self.corteges_position
+        mask=~self.activities['cortege_activity_id'].isnull()
+        grouped=self.activities[mask].groupby('cortege_activity_id')
+        for k in grouped.groups.keys():
+            cortege = Cortege()
+            cortege.fit(index=k, labels=grouped.groups[k], data=self.activities)
+            self.corteges.update({cortege.index: cortege})
+
+
+    def get_executors(self,*args,sdate='01.01.2022',file='executors.sql',**kwargs):
+        def get_allowed():
+            execu_keys=self.ftmatrix.index[1].diction.keys()
+            activ_keys=self.ftmatrix.index[0].diction.keys()
+
+            self.executor_index=np.ma.array(list(execu_keys),dtype=np.int32,fill_value=-1)
+            self.executor_index.mask = np.ones(self.executor_index.shape[0],dtype=bool)
+            self.activity_index = np.ma.array(list(activ_keys), dtype=np.int32, fill_value=-1)
+            self.activity_index.mask = np.ones(self.activity_index.shape[0], dtype=bool)
+            if (self.executor_index.shape[0]==0)|(self.activity_index.shape[0]==0):
+                return
+
+            for i,akey in enumerate(activ_keys):
+                val=False
+                for j,ekey in enumerate(execu_keys):
+                    val_=self.ftmatrix[akey,ekey]
+                    if val_& (not val):
+                        val=True
+                    if self.executor_index.mask[j]:
+                        self.executor_index.mask[j] = False
+                        break
+                if val:
+                    self.activity_index.mask[i] = False
+
+
+
+
+        if self.activities is None:
+            self.get_activities(*args,**kwargs)
+
+        temp= self.unique_values
+
+        self.executors = self.session.get_executors(*args,sdate=sdate,file=file,wells=temp['well'],types=temp['act_type'],
+                                                  shops=temp['shop_id'],well_pads=temp['well_pad_id'],
+                                                  activities=temp['id'],objtypes=temp['object_type'],
+                                                    fields=temp['field_id'])
+
+        dictionary=self.get_exec_compat(data=self.executors.loc[:,['execid','meropid']])
+
+        exec_keys = IndexedDict(self.executors['execid'].value_counts().keys())
+        act_keys = IndexedDict(self.activities['id'].values)
+        self.ftmatrix= ListedDicts(dictionary, (act_keys, exec_keys), reverse=True, value=False)
+        get_allowed()
+
+    def get_executors_v1(self,sdate='01.01.2022',file='executors_obj.sql'):
+        def get_allowed():
+            execu_keys=self.ftmatrix.index[1].diction.keys()
+            activ_keys=self.ftmatrix.index[0].diction.keys()
+
+            self.executor_index=np.ma.array(list(execu_keys),dtype=np.int32,fill_value=-1)
+            self.executor_index.mask = np.ones(self.executor_index.shape[0],dtype=bool)
+            self.activity_index = np.ma.array(list(activ_keys), dtype=np.int32, fill_value=-1)
+            self.activity_index.mask = np.ones(self.activity_index.shape[0], dtype=bool)
+            if (self.executor_index.shape[0]==0)|(self.activity_index.shape[0]==0):
+                return
+
+            for i,akey in enumerate(activ_keys):
+                val=False
+                for j,ekey in enumerate(execu_keys):
+                    val_=self.ftmatrix[akey,ekey]
+                    if val_& (not val):
+                        val=True
+                    if self.executor_index.mask[j]:
+                        self.executor_index.mask[j] = False
+                        break
+                if val:
+                    self.activity_index.mask[i] = False
+
+        temp = self.unique_values
+        data=self.session.get_executors_v1(sdate=sdate,file=file,wells=temp['well'],types=temp['act_type'],
+                                                  shops=temp['shop_id'],well_pads=temp['well_pad_id'],enterprises=temp['enterprise_id'],
+                                                    fields=temp['field_id'])
+        for c in ['well_id', 'well_pad_id', 'field_id', 'shop_id', 'enterprise_id']:
+            if data[c].dtype==object:
+                data[c]=data[c].astype(np.float64)
+
+        self.executors=data
+        dictionary=self.get_compat_dictionary(self.executors,self.activities)
+        exec_keys = IndexedDict(self.executors['id'].value_counts().keys())
+        act_keys = IndexedDict(self.activities['id'].values)
+        self.ftmatrix= ListedDicts(dictionary, (act_keys, exec_keys), reverse=True, value=False)
+        get_allowed()
+
+        #return data
+        #self.executor_index=self.ftmatrix.index[1].diction
+
+    def get_roadmap(self,*args,**kwargs):
+        if self.activities is None:
+            self.get_activities(*args,**kwargs)
+
+        road_map = self.session.get_roads(wells_id=self.unique_values['well_pad_id'])
+        road_map['distance_time']=road_map['distance_time']*self.time_scale
+        rmap = cppmath.RoadMap()
+        rmap.fill_dictionary(road_map[['obj_id1', 'obj_id2', 'distance_time', 'mobility_type_id']])
+
+        act_keys = IndexedDict(self.activities['well_pad_id'].values)
+        zeros=(self.activities['act_type'].values==74917002)|(self.activities['act_type'].values==1452402773)
+        act_mask=IndexedDict(zeros)
+        self.ts= RMListedDicts(data=rmap, indices=(act_keys, act_mask), value=0,mobility=34712652103.0)
+    def get_roadmap_py(self,*args,defval=0.,**kwargs):
+        def fill_dictionary(data=pd.DataFrame([],
+                                              columns=['obj_id1', 'obj_id2', 'distance_time', 'mobility_type_id'])):
+            diction=dict({})
+            for i in data.index:
+                moby=data.at[i,'mobility_type_id']
+                obj1=data.at[i,'obj_id1']
+                obj2 = data.at[i, 'obj_id2']
+                val=data.at[i, 'distance_time']
+                if np.isnan(val):
+                    val=defval
+
+                if obj1>obj2:
+                    key=(moby,obj2,obj1)
+                else:
+                    key = (moby, obj1, obj2)
+                mask=map(lambda x: ~np.isnan(x),key)
+                if all(mask):
+                    diction.update({key:val})
+            return diction
+
+
+        if self.activities is None:
+            self.get_activities(*args,**kwargs)
+
+        road_map = self.session.get_roads(wells_id=self.unique_values['well_pad_id'])
+        road_map['distance_time']=road_map['distance_time']*self.time_scale
+        rmap=fill_dictionary(data=road_map[['obj_id1', 'obj_id2', 'distance_time', 'mobility_type_id']])
+
+        act_keys = IndexedDict(self.activities['well_pad_id'].values)
+        zeros=(self.activities['act_type'].values==74917002)|(self.activities['act_type'].values==1452402773)
+        act_mask=IndexedDict(zeros)
+        self.ts= RMListedDicts_py(data=rmap, indices=(act_keys, act_mask), value=0,mobility=34712652103.0)
+    def get_blocks(self,*args,epsilon=0.,**kwargs):
+        if self.activities is None:
+            self.get_activities(*args,**kwargs)
+        types = self.session.get_joint_by_rules(types_id=self.unique_values['act_type'])
+        comp = cppmath.Compatibility()
+        comp.fill_dictionary(types[['cf', 'ct', 'hours']].values)
+        commatrix = np.ones(shape=(self.activities.shape[0], self.activities.shape[0]), dtype=bool)
+        coord = self.activities.loc[:, ['act_type', 'latitude', 'longitude']].values
+        comp.fill_commatrix(coord, commatrix, epsilon)
+        self.blocks=commatrix
+
+
+
+    def get_bounds_dict(self,array=np.array([[0,0,0]]),value=100.):
+        assert isinstance(array,np.ndarray),"array is not numpy.ndarray"
+        assert array.shape[1]==3,"expected 3 columns"
+        diction=self.pair_diction
+        for a in array:
+            f1=a[0]
+            f2=a[1]
+            d=a[2]
+            if ~np.isnan(d):
+                diction.update((f1, f2),d)
+        return diction
+
+    def get_compatibility_matrix(self,coordinates=np.array([[0,0,0]]),value=100):
+        bounds=self.pair_diction
+        n=coordinates.shape[0]
+        comp_matrix=np.ones(shape=(n,n),dtype=bool)
+        i=0
+        while i<n:
+            x_act_type = coordinates[i, 0]
+            x_latitude = coordinates[i, 1]
+            x_longtitude = coordinates[i, 2]
+
+            j=i+1
+            if np.isnan(x_latitude) | np.isnan(x_longtitude):
+                i+=1
+                #print('i', i)
+                continue
+            while j<n:
+                y_act_type = coordinates[j, 0]
+                y_latitude = coordinates[j, 1]
+                y_longtitude = coordinates[j, 2]
+                if ~np.isnan(y_latitude) & ~np.isnan(y_longtitude):
+                    try:
+                        epsilon=bounds[(x_act_type,y_act_type)]
+                    except KeyError:
+                        epsilon=value
+                    if np.isnan(epsilon):
+                        epsilon=value
+
+                    distance=cppmath.distance(x_latitude,x_longtitude,y_latitude,y_longtitude)
+                    if i == 0:
+                        print(epsilon,distance,x_act_type,y_act_type )
+
+                    if distance<epsilon:
+                        comp_matrix[i, j]=False
+                        comp_matrix[j, i] = False
+                j+=1
+
+            i += 1
+
+        return comp_matrix
+
+
+    def get_executors_compatibility_matrix(self,executors=dict({}),activities=np.array([])):
+        def get_mask(activs,etp=dict({}),index=np.array([],dtype=np.int32),column_index=0):
+            mask = np.zeros(activs.shape[0], dtype=bool)
+            for k in etp.keys():
+                if k>0:
+                    kmask=activs[index,column_index]==k
+                    subindex=index[~kmask]
+                    mask[index[kmask]]=True
+                else:
+                    subindex=index
+                ci=column_index+1
+                if ci<activs.shape[1]:
+                    submask=get_mask(activs,etp=etp[k],index=subindex,column_index=ci)
+                    mask=mask|submask
+
+
+            return mask
+
+
+
+        assert isinstance(executors,dict),"Executors should be a dict"
+        assert isinstance(activities,
+                          np.ndarray), "Activities should be a np.ndarray"
+        #activities columns [0] -> activ_id;[1] ->type_id; [2]-> well_id; [3] -> pad_id;[4] -> field;[5]->shop [6] -> enterprise
+        # executors columns [0] -> exec_id;[1] ->type_id; [2]-> well_id; [3] -> pad_id;[4] -> field;[5]->shop [6] -> enterprise
+        matrix=np.zeros(shape=(activities.shape[0],len(executors.keys())),dtype=bool)
+
+        i=0
+        for ex in executors.keys():
+            types=executors[ex].keys()
+            mask=np.zeros(activities.shape[0],dtype=bool)
+            for t in types:
+                tmask=activities[:,1]==t
+                #print(tmask[tmask==True].shape)
+                index=np.arange(activities.shape[0])
+                subdict=executors[ex][t]
+                emask=get_mask(activities,etp=subdict,index=index[tmask],column_index=2)
+                #print(emask[emask == True].shape)
+                mask=mask|emask
+                #print(mask[mask == True].shape)
+
+            matrix[:,i]=mask
+
+            i+=1
+        return matrix
+
+
+    def get_executors_dict(self,executors=pd.DataFrame([['execid','merop_id']]),i=0,index=None,keys=None):
+        if i==0:
+            keys=executors.columns
+            index = executors.index
+
+        groups=executors.loc[index].groupby(keys[i]).groups
+        dictionary = dict({})
+
+        for k in groups.keys():
+
+            index=groups[k]
+            i_=i+1
+            if i_<len(keys):
+                subdict=self.get_executors_dict(executors=executors,i=i_,index=index,keys=keys)
+                #print('k',k)
+                dictionary.update({k:subdict})
+        return dictionary
+
+    def get_exec_compat(self,data=pd.DataFrame(columns=['execid','meropid'])):
+        mask=~data.loc[:,'execid'].isnull()
+        gby=data.loc[mask].groupby('execid')
+        dictionary=dict({})
+        for e in gby.groups:
+            index=gby.groups[e]
+            di=dict({})
+            for i in index:
+                mid=data.at[i,'meropid']
+                di.update({mid:True})
+            dictionary.update({e:di})
+        return dictionary
+    def get_compat_dictionary(self,executors,activities):
+        def get_act_obj(index, data):
+            return data.loc[index, ['well', 'well_pad_id', 'field_id', 'shop_id', 'enterprise_id']].values
+
+        def get_exec_obj(index, data):
+            return data.loc[index, ['well_id', 'well_pad_id', 'field_id', 'shop_id', 'enterprise_id']].values
+
+        def isvalid(exec_row, object_row):
+            i = 0
+            for s in exec_row:
+                if ~np.isnan(s):
+                    if s == object_row[i]:
+                        return True
+                i += 1
+            return False
+
+        grouped_exec = executors.groupby('type_id').groups
+        grouped_act = activities.groupby('act_type').groups
+        dictionary=dict({})
+        for e in grouped_exec:
+            index=grouped_exec[e]
+            aindex = grouped_act[e]
+            for i in index:
+                exec_id=executors.at[i,'id']
+                try:
+                    executor=dictionary[exec_id]
+                except KeyError:
+                    dictionary[exec_id]=dict({})
+                    executor = dictionary[exec_id]
+                exec_row=get_exec_obj(i,executors)
+                for a in aindex:
+                    act_row=get_act_obj(a,activities)
+                    if isvalid(exec_row,act_row):
+                        act_id=activities.at[a,'id']
+                        executor.update({act_id:True})
+        return dictionary
+
+
+    class PairsDict(dict):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+
+        def __getitem__(self, key):
+            key=self.get_ordered(key)
+            return super().__getitem__(key)
+
+        def get_ordered(self,pair):
+            pair0=pair[0]
+            pair1=pair[1]
+            if pair0>pair1:
+                pair=(pair1, pair0)
+            return pair
+
+        def update(self, key, value) -> None:
+                super().update({self.get_ordered(key): value})
+
+class EngineeringTosec:
+    def __init__(self,*args,**kwargs):
+
+        self.compatibility=np.array([])
+        self.pair_diction=self.PairsDict()
+        self.Q0=np.array([],dtype=np.float64)
+        self.Q1 = np.array([],dtype=np.float64)
+        self.duration=np.array([],dtype=np.int64)
+        self.support=np.array([],dtype=np.int64).reshape(-1,2)
+        #self.acmatrix=np.array([],dtype=bool)
+        self.ftmatrix = ListedDicts(value=False,reverse=True)
+        self.blocks=np.ones([],dtype=bool)
+        #self.ts=RMListedDicts(value=0)
+        self.ts = RMListedDicts_py(value=0)
+        self.used = np.zeros([], dtype=bool)
+        self.roadmap=ListedDicts(value=False,reverse=True)
+        self.session=None
+        self.activities=None
+        self.executors = None
+        self.unique_values=dict({})
+        self.ufields=['id','well','object_type','well_pad_id','act_type','field_id','shop_id','enterprise_id']
+        self.executor_index = None
+        self.activity_index = None
+        self.time_scale=1
+        self.begin=np.datetime64('2022-01-01')
+        self.end=np.datetime64('2023-03-01')
+        self.time_items='s'
+        self.global_duration=(self.end-self.begin)/np.timedelta64(1,self.time_items)
+
+    def open_session(self,*args,**kwargs):
+        self.session = db.Session()
+        self.session.open()
+
+    def get_activities(self,*args,**kwargs):
+        def get_unique(field='id',include_nan=False):
+            if not include_nan:
+                try:
+                    mask=~np.isnan(self.activities[field].values)
+                except TypeError:
+                    mask = ~self.activities[field].isnull()
+                uvalues = np.unique(self.activities.loc[mask, field].values)
+            else:
+                uvalues = np.unique(self.activities.loc[:,field].values)
+            return tuple(uvalues)
+
+        if self.session is None:
+            self.open_session(*args,**kwargs)
+
+        self.activities=self.session.get_activities(*args,**kwargs)
+        self.support=(self.activities[['supp0','supp1']].values-self.begin)/np.timedelta64(1,self.time_items)
+        mask=np.where(~np.isnan(self.support[:,0]) & np.isnan(self.support[:,1]))
+        self.support[mask,1]=self.global_duration
+        self.Q0=self.activities['Q0'].values
+        self.Q1 = self.activities['Q1'].values
+        mask=np.where(np.isnan(self.Q0))[0]
+        self.Q0[mask]=0.
+        mask=np.where(np.isnan(self.Q1))[0]
+        self.Q1[mask]=0.
+        #mask = np.where(np.isnan(self.activities['duration'].values))[0]
+        self.duration=(self.activities['plan_end']-self.activities['plan_begin'])/np.timedelta64(1,self.time_items)
+        #self.duration[mask]=0
+
+
+
+        for c in self.ufields:
+            values_= get_unique(field=c)
+            self.unique_values.update({c:values_})
+
+    def get_executors(self,*args,**kwargs):
+        def get_allowed():
+            execu_keys=self.ftmatrix.index[1].diction.keys()
+            activ_keys=self.ftmatrix.index[0].diction.keys()
+
+            self.executor_index=np.ma.array(list(execu_keys),dtype=np.int32,fill_value=-1)
+            self.executor_index.mask = np.ones(self.executor_index.shape[0],dtype=bool)
+            self.activity_index = np.ma.array(list(activ_keys), dtype=np.int32, fill_value=-1)
+            self.activity_index.mask = np.ones(self.activity_index.shape[0], dtype=bool)
+            if (self.executor_index.shape[0]==0)|(self.activity_index.shape[0]==0):
+                return
+
+            for i,akey in enumerate(activ_keys):
+                for j,ekey in enumerate(execu_keys):
+                    val=self.ftmatrix[akey,ekey]
+                    if val:
+                        self.executor_index.mask[j] = False
+                        self.activity_index.mask[i] = False
+                        break
+
+
+
+
+        if self.activities is None:
+            self.get_activities(*args,**kwargs)
+
+        temp= self.unique_values
+        self.executors = self.session.get_executors(*args,wells=temp['well'],types=temp['act_type'],
+                                                  shops=temp['shop_id'],well_pads=temp['well_pad_id'],
+                                                  activities=temp['id'],objtypes=temp['object_type'],
+                                                    fields=temp['field_id'])
+
+        dictionary=self.get_exec_compat(data=self.executors.loc[:,['execid','meropid']])
+
+        exec_keys = IndexedDict(self.executors['execid'].value_counts().keys())
+        act_keys = IndexedDict(self.activities['id'].values)
+        self.ftmatrix= ListedDicts(dictionary, (act_keys, exec_keys), reverse=True, value=False)
+        get_allowed()
+        #self.executor_index=self.ftmatrix.index[1].diction
+
+    def get_roadmap(self,*args,**kwargs):
+        if self.activities is None:
+            self.get_activities(*args,**kwargs)
+
+        road_map = self.session.get_roads(wells_id=self.unique_values['well_pad_id'])
+        road_map['distance_time']=road_map['distance_time']*self.time_scale
+        rmap = cppmath.RoadMap()
+        rmap.fill_dictionary(road_map[['obj_id1', 'obj_id2', 'distance_time', 'mobility_type_id']])
+
+        act_keys = IndexedDict(self.activities['well_pad_id'].values)
+        self.ts= RMListedDicts(data=rmap, indices=(act_keys, act_keys), value=0,mobility=34712652103.0)
+    def get_roadmap_py(self,*args,defval=0.,**kwargs):
+        def fill_dictionary(data=pd.DataFrame([],
+                                              columns=['obj_id1', 'obj_id2', 'distance_time', 'mobility_type_id'])):
+            diction=dict({})
+            for i in data.index:
+                moby=data.at[i,'mobility_type_id']
+                obj1=data.at[i,'obj_id1']
+                obj2 = data.at[i, 'obj_id2']
+                val=data.at[i, 'distance_time']
+                if np.isnan(val):
+                    val=defval
+
+                if obj1>obj2:
+                    key=(moby,obj2,obj1)
+                else:
+                    key = (moby, obj1, obj2)
+                mask=map(lambda x: ~np.isnan(x),key)
+                if all(mask):
+                    diction.update({key:val})
+            return diction
+
+
+        if self.activities is None:
+            self.get_activities(*args,**kwargs)
+
+        road_map = self.session.get_roads(wells_id=self.unique_values['well_pad_id'])
+        road_map['distance_time']=road_map['distance_time']*self.time_scale
+        rmap=fill_dictionary(data=road_map[['obj_id1', 'obj_id2', 'distance_time', 'mobility_type_id']])
+
+        act_keys = IndexedDict(self.activities['well_pad_id'].values)
+        self.ts= RMListedDicts_py(data=rmap, indices=(act_keys, act_keys), value=0,mobility=34712652103.0)
+    def get_blocks(self,*args,epsilon=0.,**kwargs):
+        if self.activities is None:
+            self.get_activities(*args,**kwargs)
+        types = self.session.get_joint_by_rules(types_id=self.unique_values['act_type'])
+        comp = cppmath.Compatibility()
+        comp.fill_dictionary(types[['cf', 'ct', 'hours']].values)
+        commatrix = np.ones(shape=(self.activities.shape[0], self.activities.shape[0]), dtype=bool)
+        coord = self.activities.loc[:, ['act_type', 'latitude', 'longitude']].values
+        comp.fill_commatrix(coord, commatrix, epsilon)
+        self.blocks=commatrix
+
+
+
+    def get_bounds_dict(self,array=np.array([[0,0,0]]),value=100.):
+        assert isinstance(array,np.ndarray),"array is not numpy.ndarray"
+        assert array.shape[1]==3,"expected 3 columns"
+        diction=self.pair_diction
+        for a in array:
+            f1=a[0]
+            f2=a[1]
+            d=a[2]
+            if ~np.isnan(d):
+                diction.update((f1, f2),d)
+        return diction
+
+    def get_compatibility_matrix(self,coordinates=np.array([[0,0,0]]),value=100):
+        bounds=self.pair_diction
+        n=coordinates.shape[0]
+        comp_matrix=np.ones(shape=(n,n),dtype=bool)
+        i=0
+        while i<n:
+            x_act_type = coordinates[i, 0]
+            x_latitude = coordinates[i, 1]
+            x_longtitude = coordinates[i, 2]
+
+            j=i+1
+            if np.isnan(x_latitude) | np.isnan(x_longtitude):
+                i+=1
+                #print('i', i)
+                continue
+            while j<n:
+                y_act_type = coordinates[j, 0]
+                y_latitude = coordinates[j, 1]
+                y_longtitude = coordinates[j, 2]
+                if ~np.isnan(y_latitude) & ~np.isnan(y_longtitude):
+                    try:
+                        epsilon=bounds[(x_act_type,y_act_type)]
+                    except KeyError:
+                        epsilon=value
+                    if np.isnan(epsilon):
+                        epsilon=value
+
+                    distance=cppmath.distance(x_latitude,x_longtitude,y_latitude,y_longtitude)
+                    if i == 0:
+                        print(epsilon,distance,x_act_type,y_act_type )
+
+                    if distance<epsilon:
+                        comp_matrix[i, j]=False
+                        comp_matrix[j, i] = False
+                j+=1
+
+            i += 1
+
+        return comp_matrix
+
+
+    def get_executors_compatibility_matrix(self,executors=dict({}),activities=np.array([])):
+        def get_mask(activs,etp=dict({}),index=np.array([],dtype=np.int32),column_index=0):
+            mask = np.zeros(activs.shape[0], dtype=bool)
+            for k in etp.keys():
+                if k>0:
+                    kmask=activs[index,column_index]==k
+                    subindex=index[~kmask]
+                    mask[index[kmask]]=True
+                else:
+                    subindex=index
+                ci=column_index+1
+                if ci<activs.shape[1]:
+                    submask=get_mask(activs,etp=etp[k],index=subindex,column_index=ci)
+                    mask=mask|submask
+
+
+            return mask
+
+
+
+        assert isinstance(executors,dict),"Executors should be a dict"
+        assert isinstance(activities,
+                          np.ndarray), "Activities should be a np.ndarray"
+        #activities columns [0] -> activ_id;[1] ->type_id; [2]-> well_id; [3] -> pad_id;[4] -> field;[5]->shop [6] -> enterprise
+        # executors columns [0] -> exec_id;[1] ->type_id; [2]-> well_id; [3] -> pad_id;[4] -> field;[5]->shop [6] -> enterprise
+        matrix=np.zeros(shape=(activities.shape[0],len(executors.keys())),dtype=bool)
+
+        i=0
+        for ex in executors.keys():
+            types=executors[ex].keys()
+            mask=np.zeros(activities.shape[0],dtype=bool)
+            for t in types:
+                tmask=activities[:,1]==t
+                #print(tmask[tmask==True].shape)
+                index=np.arange(activities.shape[0])
+                subdict=executors[ex][t]
+                emask=get_mask(activities,etp=subdict,index=index[tmask],column_index=2)
+                #print(emask[emask == True].shape)
+                mask=mask|emask
+                #print(mask[mask == True].shape)
+
+            matrix[:,i]=mask
+
+            i+=1
+        return matrix
+
+
+    def get_executors_dict(self,executors=pd.DataFrame([['execid','merop_id']]),i=0,index=None,keys=None):
+        if i==0:
+            keys=executors.columns
+            index = executors.index
+
+        groups=executors.loc[index].groupby(keys[i]).groups
+        dictionary = dict({})
+
+        for k in groups.keys():
+
+            index=groups[k]
+            i_=i+1
+            if i_<len(keys):
+                subdict=self.get_executors_dict(executors=executors,i=i_,index=index,keys=keys)
+                #print('k',k)
+                dictionary.update({k:subdict})
+        return dictionary
+
+    def get_exec_compat(self,data=pd.DataFrame(columns=['execid','meropid'])):
+        mask=~data.loc[:,'execid'].isnull()
+        gby=data.loc[mask].groupby('execid')
+        dictionary=dict({})
+        for e in gby.groups:
+            index=gby.groups[e]
+            di=dict({})
+            for i in index:
+                mid=data.at[i,'meropid']
+                di.update({mid:True})
+            dictionary.update({e:di})
+        return dictionary
+
+
+    class PairsDict(dict):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+
+        def __getitem__(self, key):
+            key=self.get_ordered(key)
+            return super().__getitem__(key)
+
+        def get_ordered(self,pair):
+            pair0=pair[0]
+            pair1=pair[1]
+            if pair0>pair1:
+                pair=(pair1, pair0)
+            return pair
+
+        def update(self, key, value) -> None:
+                super().update({self.get_ordered(key): value})
+class IndexedDict:
+    def __init__(self, val=np.array([], dtype=np.float64)):
+        self.diction = dict()
+        i = 0
+        while i < val.shape[0]:
+            self.diction.update({i: val[i]})
+            i += 1
+        self.shape=val.shape[0]
+
+    def __getitem__(self, item):
+        try:
+            return self.diction[item]
+        except KeyError:
+            return None
+
+class ListedDicts:
+    def __init__(self,data=dict(),indices=tuple(),value=None,reverse=False):
+        self.index=[]
+        self.count=0
+        self.shape=[]
+        self.value=value
+        assert isinstance(data,dict),"Data must be a dict"
+        self.data=data
+        assert isinstance(indices,tuple),"Indices must be a tuple of IndexedDict"
+        for i in indices:
+            assert isinstance(i,IndexedDict),'Permitted only IndexedDict items'
+            self.add(i)
+        self.shape=tuple(self.shape)
+        self.reverse=reverse
+
+
+
+
+    def add(self,InDict=IndexedDict()):
+        self.index.append(InDict)
+        self.count+=1
+        self.shape.append(InDict.shape)
+    def __getitem__(self, *item):
+        indices=item[0]
+        vals=self.data
+        n=len(indices)
+        try:
+            if self.reverse:
+                i=-1
+                while i>=-n:
+                    index=indices[i]
+                    key=self.index[i][index]
+                    vals=vals[key]
+                    #vals.append(val)
+                    i-=1
+                return vals
+
+            else:
+                i=0
+                while i<len(indices):
+                    index=indices[i]
+                    key=self.index[i][index]
+                    vals=vals[key]
+                    #vals.append(val)
+                    i+=1
+                return vals
+
+        except IndexError:
+            return self.value
+        except KeyError:
+            return self.value
+
+
+class RMListedDicts(ListedDicts):
+    def __init__(self,*args,data=cppmath.RoadMap(),mobility=34712652103.0,**kwargs):
+        super().__init__(*args,**kwargs)
+        self.data=data
+        self.mobility=mobility
+
+    def __getitem__(self, *item):
+        indices=item[0]
+
+        try:
+            mask=(self.index[1][indices[0]])|(self.index[1][indices[1]])
+            if mask:
+                return 0
+            key0 = self.index[0][indices[0]]
+            key1 = self.index[0][indices[1]]
+            vals = self.data.time(key0, key1, self.mobility)
+            return vals
+
+        except IndexError:
+            return self.value
+        except KeyError:
+            return self.value
+
+
+class RMListedDicts_py(ListedDicts):
+    def __init__(self,*args,data=dict({}),mobility=34712652103.0,**kwargs):
+        super().__init__(*args,**kwargs)
+        self.data=data
+        self.mobility=mobility
+
+    def __getitem__(self, *item):
+        indices=item[0]
+
+        try:
+            mask=(self.index[1][indices[0]]|self.index[1][indices[1]])
+            if mask:
+                return 0
+            key0 = self.index[0][indices[0]]
+            key1 = self.index[0][indices[1]]
+            if key0>key1:
+                key=(self.mobility,key1, key0)
+            else:
+                key = (self.mobility, key0, key1)
+
+            #print(key)
+            vals = self.data[key]
+            return vals
+
+        except IndexError:
+            return self.value
+        except KeyError:
+            return self.value
+
+
+
+
+
+
+
+
+
+
+
+
+
 class values:
     def __init__(self):
         self.value=np.NINF
@@ -121,6 +1070,70 @@ class values:
         self.inf=False
         self.t1=np.NINF
         self.t2=np.NINF
+
+class well_record:
+    def __init__(self):
+        self.val=np.nan
+        self.eval=np.nan
+        self.x=np.nan
+
+
+class Record:
+    def __init__(self):
+        self.index=0
+        self.niter=0
+        self.ct=0
+        self.cw=0
+        self.span=np.array([])
+        self.next_well=None
+        self.vector=dict()
+class SaftyList(list):
+    def rm(self,val):
+        try:
+            super().remove(val)
+        except ValueError:
+            pass
+    def remove(self, value):
+        if hasattr(value, '__iter__'):
+            if value is self:
+                self.clear()
+                return
+            for v in value:
+                self.rm(v)
+
+        else:
+            self.rm(value)
+
+
+
+    #def __init__(self):super().__init__()
+
+    #def __init__(self,t): super().__init__(t)
+
+    #def __init__(self,t,obj): super().__init__(t,obj)
+
+
+class log:
+    def __init__(self,record=True):
+        self.data=dict()
+        self.current_record=Record()
+        self.ci=0
+        self.record=record
+    def open(self,i):
+        self.ci=i
+        self.current_record=Record()
+        self.current_record.index=i
+        return self.current_record
+    def close(self):
+        try:
+            self.data[self.ci].append(self.current_record)
+        except KeyError:
+            self.data.update({self.ci:[self.current_record]})
+
+
+
+
+
 
 class wells_schedule:
     def __init__(self):
@@ -130,12 +1143,14 @@ class wells_schedule:
         self.unical = np.array([]) #уникальные номера скважин
         self.cd=0 #текущее значение дебита (current_debit)
         self.groups=np.array([])#начальное распределение бригад по скважинам
+        self.available_executer=np.array([],dtype=bool)
+        self.available_activities = np.array([], dtype=bool)
         #self.group_index=np.arange(self.group.shape[0]) # индексация бригад
         self.numbers=np.array([])# индексация бригад
         self.ct=np.array([]) #время освобождения бригад (current time)
         self.dt = np.array([])  # дополнительное время
-        self.st=np.array([]) #время начала работы на скважине (start time)
-        self.ts=np.array([]) #транспортная матрица
+        self.st=np.array([],dtype=np.float64) #время начала работы на скважине (start time)
+        self.ts=np.array([],dtype=np.float64) #транспортная матрица
         self.service=np.array([])#номера сервиса
         self.equipment=np.array([])  # номера сервиса
         self.wells_service=np.array([])#номера сервиса для скважин
@@ -146,6 +1161,9 @@ class wells_schedule:
         self.weights = np.array([])  # матрица рейтингов скважин
         self.fun=self.f1
         self.values=np.array([])
+        self.corteges=dict({})
+        self.corteges_index=np.array([])
+        self.support=np.array([])
         self.logistic_values = None
         self.queue=dict({}) #словарь с значениями key - номер скважины, value -
         self.vector = np.array([],dtype=bool) #вектор состояния скважин для бригады. True - значение конечное
@@ -161,6 +1179,7 @@ class wells_schedule:
         self.group_support = None
         self.transpose=False
         self.function= op.get_optim_trajectory
+        self.gap_metric=lambda x: x
         self.engine='c'
         #self.function=ex.assignment
         self.routes=None
@@ -168,9 +1187,28 @@ class wells_schedule:
         self.end=None
         self.wtime=0
         self.used=None
+        self.counter=0
+        self.tolerance=1e-3
+        self.log=log()
+        self.opened_count=0
+        self.opened_corteges=0
+        self.executors=dict({})
+        self.horizon=1
+        self.reserved_corteges=dict({})
+        self.counters=dict({})
+        self.added=0
+        self.shrinkage=0
+        self.localy_added=0
+        self.source=0
+        self.opened_activities=[]
+        self.opened_previous=np.array([])
+        self.percent=0
+        self.opened=SaftyList()
 
-    def fit(self,ts,tr,Q0,Q1,current_places,support=None,queue=dict({}),wells_allowed=None,groups_allowed=None, tracing=None, permutation=None, epsilon=np.inf,delta=3,stop=None):
-        def update_df():
+
+    def fit(self,ts,tr,Q0,Q1,current_places,support=None,queue=dict({}),corteges=dict({}),corteges_index=None,corteges_position=None,wells_allowed=None,groups_allowed=None, tracing=None, permutation=None, epsilon=np.inf,horizon=np.inf,delta=3,stop=None,
+            record=False,shrinkage=1):
+        def update_debit_functions():
             if self.routes is not None:
                 for i in np.arange(self.routes.shape[1]):
                     for j in np.arange(self.routes.shape[0]):
@@ -181,10 +1219,11 @@ class wells_schedule:
                             (span)=self.set_span(j,i)
                             self.debit_functions[well].t1=self.start[j,i]
                             self.debit_functions[well].t2=self.end[j,i]
-                            self.debit_functions[well].span=span
+                            self.debit_functions[well].span=np.array(span)
                             self.update_bounds(self.debit_functions[well])
                         except KeyError:
                             continue
+
 
         def set_initial_time():
             if self.used is not None:
@@ -197,22 +1236,75 @@ class wells_schedule:
                 mask = tv < 0
                 tv[mask] = 0
                 self.ct[self.used] = tv
+        def init_executors():
+
+            k=0
+            while k<self.groups.shape[0]:
+                executor = Executor()
+                executor.corteges_set = set()
+                executor.index = k
+                executor.epsilon = self.horizon
+                self.executors[k] = executor
+                k+=1
+
+            val=np.nanmin(self.corteges_position)
+
+            mask=self.corteges_position==val
+            activities=self.free[mask]
+
+            for a in activities:
+                i=0
+                while i<self.groups.shape[0]:
+                    if self.ftmatrix[a,i]:
+                        self.executors[i].corteges_set.add(self.corteges_index[a])
+                    i+=1
+
+            for k in self.executors.keys():
+                executor=self.executors[k]
+                if len(executor.corteges_set)>0:
+                    for s in executor.corteges_set:
+                        executor.add(s)
+                #emask=np.zeros(len(executor.corteges_set),dtype=bool)
+                #executor.corteges = np.ma.array(list(executor.corteges_set),mask=emask)
+                del executor.corteges_set
+
 
         #used - булев массив размерности groups. True - индекс бригады, размещенной на скважине для ремонта. False - бригада на скважине, но на работу не назначена.
         if (tracing is not None) and isinstance(tracing,bool):
             self.tracing=tracing
         if (permutation is not None) and isinstance(permutation, bool):
             self.permutation = permutation
+
+        if horizon>0:
+            self.horizon=horizon
+
         self.Q1=Q1
         self.Q0=Q0
         self.dQ=self.Q1-self.Q0
         self.dq=np.min(self.dQ)
+        self.log.record=record
+        self.corteges=corteges
+        self.shrinkage=shrinkage
+        if corteges_index is None:
+            self.corteges_index=np.empty(self.Q0.shape[0])
+            self.corteges_index.fill(np.nan)
+        else:
+            self.corteges_index=corteges_index
+
+        if corteges_position is None:
+            self.corteges_position=np.empty(self.Q0.shape[0])
+            self.corteges_position.fill(np.nan)
+        else:
+            self.corteges_position=corteges_position
+
 
 
         self.ts=ts
         self.tr=tr
+        self.tolerance=1e-3
         self.delta=delta
         self.free=np.arange(Q0.shape[0])
+
         self.mask=np.ones(Q0.shape[0],dtype=bool)
         self.cd=0
         self.queue=queue
@@ -229,14 +1321,18 @@ class wells_schedule:
 
         self.groups=current_places[1]
         self.used=current_places[0].astype(bool)
-        self.ct=np.zeros(self.groups.shape[0],dtype=np.float16)
-        self.st=np.zeros(self.groups.shape[0],dtype=np.float16)
-        self.dt = np.zeros(self.groups.shape[0],dtype=np.float16)
+        self.available_executer=np.ones(shape=self.groups.shape[0],dtype=bool)
+        self.ct=np.zeros(self.groups.shape[0],dtype=np.float64)
+        self.st=np.zeros(self.groups.shape[0],dtype=np.float64)
+        self.dt = np.zeros(self.groups.shape[0],dtype=np.float64)
         self.current_index = np.zeros(self.groups.shape[0],dtype=np.int32)
         self.current_indey = np.arange(self.groups.shape[0])#координата в столбце self.routes
         self.numbers = np.arange(self.groups.shape[0])
         #устанавливаем начальное время для бригад на скважинах
         set_initial_time()
+        init_executors()
+
+
 
         self.minct=self.ct.min()
         self.maxct=self.ct.max()
@@ -257,14 +1353,20 @@ class wells_schedule:
             self.support=np.empty(shape=(self.Q0.shape[0],2))
             self.support.fill(np.nan)
 
+        #init_corteges()
+
         maxsc=np.NINF
         minsc=np.inf
         supported=[]
 
         for i in self.free:
             supp=self.support[i]
+            cortege_index=self.corteges_index[i]
             wf=debit_function(self.Q0[i],self.Q1[i],self.tr[i],self.t)
             wf.index=i
+            if ~np.isnan(cortege_index):
+                wf.cortege=cortege_index
+                wf.cs=True
 
             if wells_allowed is not None:
                 proht=self.prohibits[i]
@@ -274,11 +1376,16 @@ class wells_schedule:
 
 
             mask=np.isnan(supp)
+            if any(~mask):
+                wf.cs = True
+                wf.opened = True
+                self.opened_count += 1
+
             #mark=False
             for j,m in enumerate(mask):
                 if ~m:
                     wf.supp[j]=supp[j]
-                    wf.cs=True
+
             if wf.cs:
                 supported.append(i)
                 mina=wf.scaled_v1(wf.supp[0])
@@ -304,13 +1411,17 @@ class wells_schedule:
         if not self.tracing:
             self.sindices=reverse(self.sindices)
         self.free=self.free[self.sindices]
+        self.available_activities = np.zeros(self.stop, dtype=bool)
         self.infmask=np.zeros(shape=self.stop,dtype=bool)
         self.infindex = np.zeros(shape=self.stop, dtype=np.int32)
         self.nempty = np.arange(self.groups.shape[0])
         self.maxcs=maxsc
         self.mincs=minsc
-        self.prohib_dict = self.get_prohib_dict()
-        update_df()
+        #self.prohib_dict = self.get_prohib_dict()
+        self.counter=self.free.shape[0]
+        update_debit_functions()
+
+
 
     def fit_v1(self,ts,tr,Q0,Q1,groups,support=None,used=None,stop=None,queue=dict({}),epsilon=np.inf,service=np.array([]),equipment=np.array([]),wells_service=None,wells_equipment=None,prohibits=None,delta=3.,group_support=None,tracing=None):
         def update_df():
@@ -448,8 +1559,11 @@ class wells_schedule:
         self.nempty = np.arange(self.groups.shape[0])
         self.maxcs=maxsc
         self.mincs=minsc
-        self.prohib_dict = self.get_prohib_dict()
+        #self.prohib_dict = self.get_prohib_dict()
+
         update_df()
+
+
 
     def get_group_support(self,x=0.,i=0):
         # устанавливает значение x в соответствии с ограничениями на время работы группы
@@ -494,6 +1608,7 @@ class wells_schedule:
                     mask[indices] = False
 
                     for s in indices:
+
                         try:
                             fun=self.debit_functions[s]
                             fun.key = i
@@ -505,6 +1620,11 @@ class wells_schedule:
 
             k += 1
         return frame
+    def isreserved(self,cid):
+        try:
+            return self.reserved_corteges[cid]
+        except KeyError:
+            return False
 
     def isprohibited_(self,x=0,well=0):
 
@@ -530,77 +1650,157 @@ class wells_schedule:
 
             return False
 
-    def isprohibited(self,x=0,well=0):
 
-        if np.isnan(x):
+    def try2open(self,executers=np.array([],dtype=np.int32)):
+        assigned=False
+        cover=self.cover(executers)
+        if len(cover.keys())==0:
             return False
+        self.opened.extend(cover.keys())
+        for cid in cover.keys():
+            cortege=cover[cid]
+            execut = cortege[0][1]
+            activities = cortege[0][0]
+            weigth = cortege[1]
+            t_ = weigth.min() * -1
+            mct = self.ct[execut].min()
+            t = max(mct, t_)
+            cortege_=self.corteges[cid]
+            if not cortege_.isopened():
+                bounds=cortege_.Apply(t,t)
+                self.set_compact(bounds)
+                self.opened_corteges += 1
+                for e in self.executors.keys():
+                    self.executors[e].apply(cid)
+            i=0
+            while i<activities.shape[0]:
+                ac=activities[i]
+                e=execut[i]
+                self.executors[e].injected=True
+                #set_value(ac,e)
+                i+=1
+        if len(cover.keys())>0:
+            assigned=True
+        return assigned
 
 
 
-        fun=self.debit_functions[well]
-        for i in fun.bounds.keys():
-            bound=fun.bounds[i]
-            if bound[1]<=x:
-                continue
-            if (bound[0]<=x)|((bound[1]>x+fun.tau)&(bound[0]<=x+fun.tau)):
-                return False
 
+    def get_optim_activities(self,corteges_id=np.array([],dtype=np.int32),executor=0):
+        choise=None
+        cid=None
+        reserved=[]
+        notreserved=[]
+        for cid in corteges_id:
+            if not self.isreserved(cid):
+                notreserved.append(cid)
+            else:
+                reserved.append(cid)
+        for c in notreserved:
+            reserved.append(c)
+        del notreserved
 
+        for cid in reserved:
+            if not self.corteges[cid].isopened():
+                activities=self.corteges[cid].get_activities(0)
+                mask=np.zeros(activities.shape[0],dtype=bool)
+                for i,a in enumerate(activities):
+                    func=self.debit_functions[a]
+                    if (self.ftmatrix[a,executor])&(not func.reserved):
+                        mask[i]=True
+                availabel=activities[mask]
+                if availabel.shape[0]>0:
+                    choise=availabel[0]
+                    self.debit_functions[choise].reserved=True
+                    return choise,cid
+        return choise,cid
 
-        return True
+    def empty_executors(self):
+        empty=True
+        for cid in self.executors.keys():
+            if not self.executors[cid].isempty():
+                empty=False
+                return empty
+        return empty
+
+    def update_executors(self,val=np.inf):
+        if self.empty_executors()&~(np.isinf(self.horizon)):
+            for k in self.executors.keys():
+                self.executors[k].epsilon=val
+                self.executors[k].paused=False
+            self.epsilon=np.inf
+            self.horizon=val
+
 
     def get_weights(self, indices=np.array([0])):
+        def set_tau_horizon(executers):
+            acs = self.get_opened_activities()
+            matrix = self.get_ifapply(executers, acs)
+            for i,e in enumerate(executers):
+                self.executors[e].tau_horizon=matrix[i]
+
+
+
 
         if self.stop > self.free.shape[0]:
             self.stop = self.free.shape[0]
-            self.infmask = np.zeros(shape=self.stop, dtype=bool)
-            self.infindex = np.zeros(shape=self.stop, dtype=np.int32)
-
-
-        if self.free.shape[0] < self.groups.shape[0]:
-            self.weights=np.array([])
-            self.infmask = np.zeros(shape=self.groups.shape, dtype=bool)
-            self.infindex = np.zeros(shape=self.groups.shape, dtype=np.int32)
-            k=0
-            for i in np.arange(self.free.shape[0]):
-                v = self.get_vector_t(i, array=True)
-                if k > 0:
-                    self.weights = np.vstack((self.weights, v))
-                else:
-                    self.weights = v.copy()
-                k+=1
-
-            self.nempty = self.infindex[self.infmask]
-            sargs = np.argsort(self.nempty)
-            self.nempty=self.nempty[sargs]
-            if self.nempty.shape[0] > 0:
-                self.transpose=True
-
-                return self.weights[self.nempty]
-            else:
-                return None
-        #self.weights = np.empty(shape=(self.groups.shape[0], self.free.shape[0]))
-        self.weights = np.empty(shape=(self.groups.shape[0], self.stop))
+        self.reserved_corteges=dict({})
+        self.update_executors()
+        self.weights=op.Safty2DArray(shape=(self.groups.shape[0], self.stop))
+        self.weights.fill(np.NINF)
         tolerance=self.epsilon
+        set_tau_horizon(indices)
+        step=0
         missed=[]
+        #cco=0
         forw=True
+        open_=False
         while forw:
             #t1=time.perf_counter()
+            empty=[]
             for i in indices:
                 ct = self.ct[i]
                 if ct - self.minct < tolerance:
-                    v = self.get_vector(i, array=True)
-                    self.weights[i] = v
+                    eps=self.executors[i].epsilon+step
+                    if not self.executors[i].paused:
+                        valid=self.get_vector(i,eps=eps)
+
+                    if (self.tracing)&(not self.weights.mask[i]):
+                        empty.append(i)
+
                 else:
                     missed.append(i)
-            #t2 = time.perf_counter()
-            #self.wtime += (t2-t1)
-            self.nempty = self.infindex[self.infmask]
-            sargs = np.argsort(self.nempty)
-            self.nempty=self.nempty[sargs]
+            if (len(empty)>0) & (not open_):
+                empty_=np.array(empty,dtype=np.int32)
+                assigned=self.try2open(empty_)
+                open_=True
+                if assigned:
+                    set_tau_horizon(indices)
+                    continue
+
+
+
+            self.nempty = self.weights.index[self.weights.mask]
+            nem=np.where(~np.isinf(self.weights.array.reshape(-1)))[0].shape[0]
+
+
+            if (self.nempty.shape[0]==0)&(not self.empty_executors())&(step<self.t):
+                for k in self.executors.keys():
+                    self.executors[i].paused = False
+                step+=10
+                continue
+
+
 
             if self.nempty.shape[0] > 0:
-                return np.array(self.weights)[self.nempty]
+                weights=self.weights.array[self.weights.mask]
+
+                if weights.shape[0]>weights.shape[1]:
+                    self.transpose=True
+                    return weights.T
+
+
+                return self.weights.array[self.weights.mask]
 
             else:
                 if tolerance <= self.maxct - self.minct:
@@ -615,103 +1815,67 @@ class wells_schedule:
 
         return None
 
+    def get_span(self, k=0,return_next=False):
+        def next_well(i,position=0):
+            target_=None
 
-    def get_span(self, i=0,mode='span'):
+            ci = self.current_index[i]+position
+            yci = self.current_indey[i]
+            if ci < self.routes.shape[0]:
+                target_ = self.routes[ci, yci]
+                if target_<0:
+                    target_=None
+            return target_
+        def global_span(well,next_well):
+            if (well is not None) & (next_well is not None):
+                fun1=self.debit_functions[well]
+                fun2=self.debit_functions[next_well]
+                t1=fun1.t1
+                t2=min(fun2.t1-fun1.tau-self.ts[well,next_well],fun1.supp[1])
+                return np.array([t1,t2])
+            elif (well is not None):
+                fun1 = self.debit_functions[well]
+                return np.array([fun1.t1,fun1.supp[1]])
+            else:
+                return np.array([np.NINF, np.inf])
 
-        if self.routes is None:
-            return np.inf, np.inf
-        if i >= self.routes.shape[1]:
-            return np.NINF, np.inf
+        span = np.array([np.NINF, np.inf]).reshape(-1, 2)
+        target = None
+        next_target=None
+        try:
+            if self.routes is  None:
+                raise KeyError
+            target=next_well(k)
+            next_target=next_well(k,position=1)
+            span=global_span(target,next_target)
+            fun=self.debit_functions[target]
+            tau=fun.tau
+            top=span[1]
 
-
-        ci = self.current_index[i]
-        yci=self.current_indey[i]
-
-        if ci >= self.routes.shape[0]:
-            return np.NINF, np.inf
-
-        target = self.routes[ci, yci]
-
-        if target < 0:
-            return np.NINF, np.inf
-
-        if mode=='span':
-            t1=self.debit_functions[target].span[0]
-            t2 =self.debit_functions[target].span[1]
-        elif mode=='time':
-            t1=self.debit_functions[target].t1
-            t2 =self.debit_functions[target].t2
-        else:
-            t1=np.NINF
-            t2=np.inf
-
-
-
-        return t1, t2
-
-    def get_route_weigths_v1(self) -> (np.array,np.array):
-        index_=[]
-        mask=np.where(self.current_index<self.routes.shape[0])[0]
-        for m in mask:
-            if self.routes[self.current_index[m],self.current_indey[m]]>=0:
-                index_.append(m)
-        index=np.array(index_)
-        if index.shape[0]==0:
-            return (index,index)
-
-        #index=np.where(self.routes[self.current_index[mask],self.current_indey[mask]]>=0)[0]
-        weigth=np.empty(shape=(index.shape[0],index.shape[0]))
-        mask=np.zeros(index.shape[0],dtype=bool)
-        notinf=np.zeros(index.shape[0],dtype=np.int16)
-        #weigth.fill(np.NINF)
-        weigth.fill(np.inf)
-
-        i_=0
-
-        while i_<index.shape[0]:
-            i=index[i_]
-            cw=self.groups[i]
-            ct=self.ct[i]
-            j_=0
-            isinf=True
-            while j_ < index.shape[0]:
-                j=index[j_]
-                ci=self.current_index[j]
-                yci=self.current_indey[j]
-                t1_,t2_=self.get_span(j)
-                if ~np.isinf(t2_):
-
-                    target=self.routes[ci,yci]
-                    free_ = self.isprohibited(ct, target)
-                    if (target>=0) and self.ftmatrix[target,j] and free_:
-                        #value=t2_-ct-self.ts[cw,target]
-                        value=t1_-ct-self.ts[cw,target]
-                        if ~mask[i_]:
-                            mask[i_]=True
-                            notinf[i_]=j_
-                            isinf=False
-
-                        if value>t2_:
-                            value=np.inf
+            for w in fun.prohibits:
+                if self.debit_functions[w].cs:
+                    span=op.residual(span,np.array([self.debit_functions[w].t1,self.debit_functions[w].t2]))
+            mask=np.ones(span.shape[0],dtype=bool)
+            i=0
+            while i<span.shape[0]:
+                s=span[i]
+                a=s[0]
+                b=s[1]
+                if b<top:
+                    b_=b-tau
+                    if b_>=a:
+                        span[i,1]=b_
                     else:
-                        value=np.inf
-                    weigth[i_, j_] = value
-                j_+=1
-            if isinf:
-                weigth[i_, i_]=np.NINF
-                mask[i_]=True
-                notinf[i_] = i_
-
-
-
-            i_+=1
-        indices=notinf[mask]
-        weigth_=weigth[indices,:][:,indices]
-
-        #if weigth_.shape[0]!=weigth_.shape[1]:
-            #print()
-
-        return (weigth_,indices)
+                        mask[i]=False
+                i+=1
+            span=span[mask]
+        except KeyError:
+            pass
+        finally:
+            if return_next:
+                return span, target
+            else:
+                return span
 
     def get_route_weigths(self) -> (np.array,np.array):
         index_=[]
@@ -724,11 +1888,12 @@ class wells_schedule:
             return (index,index)
 
         #index=np.where(self.routes[self.current_index[mask],self.current_indey[mask]]>=0)[0]
-        weigth=np.empty(shape=(index.shape[0],index.shape[0]))
-        mask=np.zeros(index.shape[0],dtype=bool)
-        notinf=np.zeros(index.shape[0],dtype=np.int16)
-        #weigth.fill(np.NINF)
-        weigth.fill(np.inf)
+        #weigth=np.empty(shape=(index.shape[0],index.shape[0]))
+        weigth=op.Safty2DArray(shape=(index.shape[0],index.shape[0]))
+        #mask=np.zeros(index.shape[0],dtype=bool)
+        #notinf=np.zeros(index.shape[0],dtype=np.int16)
+        weigth.fill(np.NINF)
+        #weigth.fill(np.inf)
 
         i_=0
 
@@ -737,7 +1902,7 @@ class wells_schedule:
             cw=self.groups[i]
             ct=self.ct[i]
             j_=0
-            isinf=True
+            ninf=[]
             while j_ < index.shape[0]:
                 j=index[j_]
                 ci=self.current_index[j]
@@ -746,80 +1911,126 @@ class wells_schedule:
                 if ~np.isinf(t2_):
 
                     target=self.routes[ci,yci]
-                    free_ = self.isprohibited(ct, target)
-                    if (target>=0) and self.ftmatrix[target,j] and free_:
-                        #value=t2_-ct-self.ts[cw,target]
-                        value=t1_-ct-self.ts[cw,target]
-                        if (~mask[j_])&isinf:
-                            mask[j_]=True
-                            notinf[j_]=i_
-                            isinf=False
+                    free_ = self.permitted(ct, target)
+                    allowed = self.ftmatrix[target, i]
 
-                        if value>t2_:
-                            value=np.inf
-                    else:
-                        value=np.inf
-                    weigth[i_, j_] = value
+                    #allowed=self.ftmatrix[target,j]
+                    #free_=True
+                    if (target>=0) and allowed and free_:
+                        that=ct+self.ts[cw,target]
+                        delta=self.tolerance
+                        origin=ct
+                        #if ct>t1_-delta:
+                            #origin=t1_-delta
+
+                        fun = op.GapMetrics(origin=origin, a=t1_, b=t2_, delta=0)
+                        value = fun.linear(that)
+                        weigth[i_, j_] = value
+                        if ~np.isinf(value):
+                            ninf.append(j_)
                 j_+=1
-            if isinf:
-                weigth[i_, i_]=np.NINF
-                mask[i_]=True
-                notinf[i_] = i_
+            if ~weigth.mask[i_]:
+                ninf=np.array(ninf, dtype=np.int32)
+                weigth.swap(i_,ninf)
+
 
 
 
             i_+=1
-        indices=notinf[mask]
-        weigth_=weigth[indices,:][:,indices]
+        indices=weigth.mask
+        weigth_=weigth.array[indices,:][:,indices]
 
-        #if weigth_.shape[0]!=weigth_.shape[1]:
-            #print()
+
 
         return (weigth_,index[indices])
 
-    def get_span_v1(self,i=0):
+    def get_cortege_weigths(self,cortege_id,executers=np.array([],dtype=np.int32)) -> (np.array, np.array):
+        cortege=self.corteges[cortege_id]
+        bounds=cortege.get_bounds()
+        index=np.array(list(bounds.keys()),dtype=np.int32)
 
-        if self.routes is None:
-            return np.inf,np.inf
-        if i >= self.routes.shape[1]:
-            return np.NINF, np.inf
+        weigth = op.Safty2DArray(shape=(index.shape[0], executers.shape[0]))
 
-        ci = self.current_index[i]
+        weigth.fill(np.NINF)
+        i = 0
+        while i < index.shape[0]:
+            activity=index[i]
+            b=bounds[activity][1]
+            j = 0
+            ninf=[]
 
-        if ci >= self.routes.shape[0]:
-            return np.NINF, np.inf
+            while j < executers.shape[0]:
+                e=executers[j]
+                if not self.ftmatrix[activity,e]:
+                    j+=1
+                    continue
 
-        target = self.routes[ci, i]
+                ct = self.ct[e]
+                cw=self.groups[e]
+                delta=b-ct-self.ts[cw,activity]
+                weigth[i,j]=delta
+                ninf.append(j)
+                j += 1
 
-        if target<0:
-            return np.NINF, np.inf
 
-        t1 = self.start[ci, i]
-        t2 = self.end[ci, i]
-        if ci < self.routes.shape[0] - 1:
-            next_target = self.routes[ci + 1, i]
-            if next_target>=0:
-                t3 = self.start[ci + 1, i]
-                ts = self.ts[target, next_target]
-            else:
-                t3 = np.inf
-                ts = np.inf
-        else:
-            t3 = np.inf
-            ts = np.inf
-        fun=self.debit_functions[target]
-        bound = fun.supp[1]
-        delta = get_delta(t1, t2, t3, ts=ts, bound=bound)
-        tau=np.inf
 
-        for i in fun.prohibits:
-            fun_=self.debit_functions[i]
-            if (not fun_.used) and (fun_.cs) and (fun_.supp[0]>=t2):
-                tau_=fun_.supp[0]-t2
-                if tau_<tau:
-                    tau=tau_
-        delta=min(delta,tau)
-        return t1,t1+delta
+            if ~weigth.mask[i]:
+                ninf = np.array(ninf, dtype=np.int32)
+                weigth.swap(i, ninf)
+
+            i+= 1
+        #indices = weigth.mask
+        #weigth_ = weigth.array[indices, :][:, indices]
+        return weigth,index
+    def assign_corteges(self,executers=np.array([],dtype=np.int32)):
+        assigned=dict()
+        for cid in self.corteges.keys():
+            if self.corteges[cid].isopened()|self.corteges[cid].reserved:
+                continue
+            weigths,activities=self.get_cortege_weigths(cortege_id=cid,executers=executers)
+            mask=weigths.mask
+            #nempty=executers[mask]
+            if mask[mask].shape[0]==0:
+                continue
+            index,s=self.function(weigths[mask],criterion='max',engine=self.engine)
+
+            weigths_=weigths[mask][index[0],index[1]]
+            assigned[cid]=np.array([activities[mask],executers[index[1]]],dtype=np.int32),weigths_
+
+        if len(assigned.keys())>0:
+            soassigned = dict(sorted(assigned.items(), key=lambda item: item[1][1].shape[0], reverse=True))
+            return soassigned
+
+        return assigned
+    def cover(self,executers=np.array([],dtype=np.int32)):
+        go=True
+        covered=dict()
+        while go:
+            assigned=self.assign_corteges(executers)
+            #covered=[]
+            count=0
+            for k in assigned.keys():
+                subexecuters=assigned[k][0][1]
+
+                if subexecuters.shape[0]>executers.shape[0]:
+                    continue
+                mask=np.isin(executers,subexecuters)
+                if mask[mask].shape[0]<subexecuters.shape[0]:
+                    continue
+                executers=executers[~mask]
+                covered[k]=assigned[k]
+                count+=1
+                self.corteges[k].reserved=True
+            if (count==0)|(executers.shape[0]==0):
+                go=False
+                break
+            #covered_.extend(covered)
+        for k in self.corteges.keys():
+            self.corteges[k].reserved = False
+        return covered
+
+
+
 
     def set_span(self,ci=0,i=0):
 
@@ -850,280 +2061,438 @@ class wells_schedule:
         fun=self.debit_functions[target]
         bound = fun.supp[1]
         delta = get_delta(t1, t2, t3, ts=ts, bound=bound)
-        tau=np.inf
 
-        for i in fun.prohibits:
-            fun_=self.debit_functions[i]
-            if (not fun_.used) and (fun_.cs) and (fun_.supp[0]>=t2):
-                tau_=fun_.supp[0]-t2
-                if tau_<tau:
-                    tau=tau_
-        delta=min(delta,tau)
         return t1,t1+delta
 
-    def finit(self,a=np.NINF,b=np.inf):
+    def finit(self,span=np.array([]),tolerance=0):
         def function(fun,x=0.):
-            if (x>=a)&(x<=b):
+            if op.inset(x,span,epsilon=tolerance):
                 return self.fun(x=x,fun=fun)
             else:
                 return np.NINF
         return function
+    def get_opened_activities(self):
+        opened = []
+        for a in self.free:
+            fun=self.debit_functions[a]
+            if (fun.opened)&(fun.cortege is not None):
+                opened.append(a)
+        return np.array(opened,dtype=np.int32)
+
+    def get_ifapply(self,executors=np.array([],dtype=np.int32),activities=np.array([],dtype=np.int32)):
+        matrix=np.empty(shape=(executors.shape[0]))
+        matrix.fill(np.inf)
+        for i,a in enumerate(activities):
+            cortege_index=self.corteges_index[a]
+            tau=self.tr[a]
+            if np.isnan(cortege_index):
+                continue
+            else:
+                cortege=self.corteges[cortege_index]
+            for j,e in enumerate(executors):
+                if not self.ftmatrix[a,e]:
+                    continue
+                cw=self.groups[e]
+                t=self.ct[e]+self.ts[cw,a]
+                bounds=cortege.ifapply(a,t,t+tau)
+                if bounds is None:
+                    continue
+                for k in bounds.keys():
+                    time=bounds[k][1]
+                    for s,ex in enumerate(executors):
+                        if self.ftmatrix[k,ex]:
+                            if time<matrix[s]:
+                                matrix[s]=time
+        return matrix
 
 
-    def check_infty(self,v=np.array([]),gi=0):
-        indices=np.arange(self.vector.shape[0])
-
-        index=indices[self.vector]
-        infty=indices[~self.infmask]
-        self.nempty = self.infindex[self.infmask]
-        stop=False
-        for i in index:
-            x=v[i]
-            ihat=self.infindex[i]
-            for j in infty:
-                y=self.weights[ihat,j]
-                if ~np.isinf(y):
-                    self.infmask[j]=True
-                    self.infindex[j]=ihat
-                    self.infindex[i]=gi
-                    stop=True
-                    break
-            if stop:
-                break
-        if not stop:
-            for i in index:
-                x=v[i]
-                ihat = self.infindex[i]
-                y = self.weights[ihat, i]
-                if x>y:
-                    self.infindex[i]=gi
-                    break
 
 
 
-        #return x
 
 
-    def get_vector(self, i=0, array=True):
-        values = []
+
+    def get_vector(self, i=0,eps=np.inf):
         cw = self.groups[i]
-
         k = 0
         inf = True
         # i- индекс бригады
-        a_, b_ = self.get_span(i)
-        fun = self.finit(a_, b_)
-        next_well = None
+        span,next_well=self.get_span(i,return_next=True)
+        finit=self.finit(span=span,tolerance=self.tolerance)
+        inspan=False
+        if next_well is not None:
+            inspan=True
         cv = np.inf
         dt = 0.
         ck = None
-        #teta = np.where(self.free == 25)[0]
-        self.vector=np.zeros(shape=self.stop,dtype=bool)
-        # fun()
-        if ~np.isinf(a_):
-            # wi- индекс следующей по расписанию скважины
-            # next_well- номер следующей по расписанию скважины
-            wi = self.current_index[i]
-            yci = self.current_indey[i]
-            next_well = self.routes[wi, yci]
-            #if (cw==156)&(next_well==56):
-                #print()
+        ninf=[]
+        available=False
+        allowed = np.zeros(shape=self.stop, dtype=bool)
+        free_=False
+        x=None
+        y=None
+        valid=False
+        tau_horizon=self.executors[i].tau_horizon
 
-            #print('i=',i,' next=', next_well)
+        if self.log.record:
+            log=self.log.open(i)
+            log.cw=cw
+            log.ct=self.ct[i]
+            log.next_well=next_well
+            log.niter=self.counter
+            log.span=span
+
 
         while k < self.stop:
             j = self.free[k]
+            value=self.weights[i, k]
+            if j==next_well:
+                ck=k
             func = self.debit_functions[j]
+            inspan=inspan & (not func.cs)
+            #func=finit(func_)
+            func.current_index = k
+            allow = self.ftmatrix[j, i]
+            if not allow:
+                k+=1
+                continue
 
-            a = self.ts[cw, j]
-            x = a + self.ct[i]
+            else:
+                allowed[k]=True
+                available=True
 
             if self.tracing:
-                x=self.set_bound(x,func)
+                if not func.opened:
+                    k+=1
+                    continue
+                if self.ct[i]>func.supp[1]:
+                    k+=1
+                    continue
+                if self.ct[i] + eps < func.supp[0]:
+                    k+=1
+                    continue
+                else: valid = True
 
-            x=self.get_group_support(x,i)
-            #t1=time.perf_counter()
-            free_=self.isprohibited(x,j)
-            #t2 = time.perf_counter()
-            #self.wtime+=(t2-t1)
 
-            if (self.ftmatrix[j,i])& free_:
 
-                func.current_index=k
 
+                x=self.solved_time(other=j,current=cw,
+                                current_index=i,tracing=self.tracing,span_=(span,next_well))
+                if(x+func.tau>tau_horizon):
+                    k+=1
+                    continue
+
+            else:
+                z=self.solved_time(other=j,current=cw,
+                                current_index=i,tracing=self.tracing,span_=(span,next_well),return_inspan=inspan)
+                if inspan:
+                    x=z[0]
+                    y=z[1]
+                else:
+                    x=z
+
+            if self.log.record:
+                wrec = well_record()
+                wrec.x=x
+                log.vector.update({j:wrec})
+
+            if x is not None:
+                free_=True
+            else:
+                k+=1
+                continue
+
+            if allow & free_:
                 if next_well is not None:
                     if j == next_well:
-                        ck = k
-                        dt = a_ - x
-                        if dt<0:
-                            dt=0
-
-                        value = fun(fun=func, x=x)
-
-
+                        value=finit(func,x)
+                        #value=self.fun(x,func)
                     else:
-                        hat = x + self.tr[j] + self.ts[j, next_well]
-                        hat = self.get_group_support(hat, i)
-                        if hat <= b_:
-                            if not func.cs:
-                                value = self.fun(x=x, fun=func)
+                        if (not func.cs)&(y is not None):
+                            value = self.fun(x=x, fun=func)
 
-                            else:
-                                value = np.NINF
-                        else:
-                            value = np.NINF
+                        #else:
+                            #value = np.NINF
 
                 else:
                     if self.tracing:
-                        value = self.fun(x=x, fun=func)
+                        penalty = self.penalty(other=j, current=cw,
+                                          current_index=i, func=func)
+
+                        value = self.fun(x=x, fun=func,penalty=penalty)
                     else:
                         if not func.cs:
                             value = self.fun(x=x, fun=func)
 
-                        else:
-                            value = np.NINF
+                        #else:
+                            #value = np.NINF
 
-            else:
-                value = np.NINF
-
+            #else:
+                #value = np.NINF
 
             if ~np.isinf(value):
-                self.vector[k]=True
+                self.weights[i, k] = value
+                ninf.append(k)
 
 
-            if inf & ~np.isinf(value):
+            if self.log.record:
+                log.vector[j].val=value
 
-                if ~self.infmask[k]:
-                    self.infmask[k] = True
-                    self.infindex[k] = i
-                    inf = False
-
-            values.append(value)
             k += 1
+        if not available:
+            self.available_executer[i]=False
 
-        if inf:
+        if ~self.weights.mask[i]:
             if (next_well is not None) and (ck is not None):
                 k = ck
-
-                self.infmask[k] = True
-                self.infindex[k] = i
-                inf = False
-                values[k] = cv
-                self.dt[i] = dt
+                self.weights.setinf(i=i, j=k, value=cv)
 
             else:
-                self.check_infty(np.array(values),i)
-
-        if array:
-            return np.array(values).reshape(1,-1)
-        else:
-            return values
-
- # вычисление вектора состояний для случая, когда количество бригад больше, чем количество скважин
-    def get_vector_t(self,i=0,array=True):
-        values=[]
-        cw=self.free[i]
-        func=self.debit_functions[cw]
-        func.current_index=i
-        k=0
-        inf=True
-        cv = np.inf
-        ck = None
-        dt=0.
-        nw = None
-        self.vector = np.zeros(shape=self.groups.shape[0], dtype=bool)
-
-
-        while k<self.groups.shape[0]:
-            j=self.groups[k]
-            a = self.ts[j, cw]
-            x = a + self.ct[k]
-            if self.tracing:
-                x=self.set_bound(x,func)
-            #if (cw==263)&(x>=181):
-                #print()
-            x=self.get_group_support(x,k)
-            free_ = self.isprohibited(x, cw)
-
-
-
-            if self.ftmatrix[cw,k]&free_:
-
-                # k- индекс бригады
-                a_, b_ = self.get_span(k)
-                fun = self.finit(a_, b_)
-                next_well = None
-
-                if ~np.isinf(a_):
-                    # wi- индекс следующей по расписанию скважины
-                    # next_well- номер следующей по расписанию скважины
-                    wi = self.current_index[k]
-                    yci = self.current_indey[k]
-                    next_well = self.routes[wi, yci]
-
-
-                if next_well is not None:
-                    if cw == next_well:
-                        ck = k
-                        dt = a_ - x
-                        if dt<0:
-                            dt=0
-
-                        nw = next_well
-                        value = fun(fun=func, x=x)
-                    else:
-                        hat = x + self.tr[cw] + self.ts[cw, next_well]
-                        hat = self.get_group_support(hat, k)
-                        if hat <= b_:
+                if not self.tracing:
+                    k=0
+                    while k<allowed.shape[0]:
+                        if allowed[k]:
+                            j = self.free[k]
+                            func = self.debit_functions[j]
                             if not func.cs:
-                                value = self.fun(x=x, fun=func)
-                            else:
-                                value = np.NINF
+                                tmax = self.solved_time(other=j, current=cw,current_index=i,
+                                                        set_blocked=True, tracing=self.tracing)
+                                value = self.fun(x=tmax, fun=func)
+                                if self.log.record:
+                                    log.vector[j].eval = value
+                                if ~np.isinf(value):
+                                    self.weights[i,k] = value
+                                    ninf.append(k)
+                        k+=1
+                self.weights.swap(i,np.array(ninf,dtype=np.int32))
+        if self.log.record:
+            self.log.close()
+        return valid
+
+    def get_vector_v1(self, i=0,eps=np.inf):
+        cw = self.groups[i]
+        k = 0
+        inf = True
+        # i- индекс бригады
+        span,next_well=self.get_span(i,return_next=True)
+        finit=self.finit(span=span,tolerance=self.tolerance)
+        inspan=False
+        if next_well is not None:
+            inspan=True
+        cv = np.inf
+        dt = 0.
+        ck = None
+        ninf=[]
+        available=False
+        allowed = np.zeros(shape=self.stop, dtype=bool)
+        free_=False
+        x=np.nan
+        y=np.nan
+        valid=False
+
+        if self.log.record:
+            log=self.log.open(i)
+            log.cw=cw
+            log.ct=self.ct[i]
+            log.next_well=next_well
+            log.niter=self.counter
+            log.span=span
+
+
+        while k < self.stop:
+            j = self.free[k]
+            #if (i==11)&(j==260):
+                #print()
+            if j==next_well:
+                ck=k
+            func = self.debit_functions[j]
+            inspan=inspan & (not func.cs)
+            #func=finit(func_)
+            func.current_index = k
+            allow = self.ftmatrix[j, i]
+
+            if allow:
+                allowed[k]=True
+                available=True
+
+            if self.tracing:
+                if allow & func.opened &(self.ct[i]<=func.supp[0]):
+                    if self.ct[i] + eps < func.supp[0]:
+                        self.weights[i, k] = np.NINF
+                        k+=1
+                        continue
+                    else: valid = True
+
+
+                x=self.solved_time(other=j,current=cw,
+                                current_index=i,tracing=self.tracing,span_=(span,next_well))
+            else:
+                z=self.solved_time(other=j,current=cw,
+                                current_index=i,tracing=self.tracing,span_=(span,next_well),return_inspan=inspan)
+                if inspan:
+                    x=z[0]
+                    y=z[1]
+                else:
+                    x=z
+
+            if self.log.record:
+                wrec = well_record()
+                wrec.x=x
+                log.vector.update({j:wrec})
+
+
+
+
+            if ~np.isnan(x):
+                free_=True
+
+            if allow & free_:
+                if next_well is not None:
+                    if j == next_well:
+                        value=finit(func,x)
+                        #value=self.fun(x,func)
+                    else:
+
+                        if (not func.cs)&(~np.isnan(y)):
+                            value = self.fun(x=x, fun=func)
+
                         else:
                             value = np.NINF
 
                 else:
                     if self.tracing:
-                        value = self.fun(x=x, fun=func)
+                        penalty = self.penalty(other=j, current=cw,
+                                          current_index=i, func=func)
+
+                        value = self.fun(x=x, fun=func,penalty=penalty)
                     else:
                         if not func.cs:
                             value = self.fun(x=x, fun=func)
+
                         else:
                             value = np.NINF
+
             else:
                 value = np.NINF
 
-
-
             if ~np.isinf(value):
-                self.vector[k]=True
+                ninf.append(k)
 
-            if inf&~np.isinf(value):
+            self.weights[i,k] = value
+            if self.log.record:
+                log.vector[j].val=value
 
-                if ~self.infmask[k]:
-                    self.infmask[k]=True
-                    self.infindex[k]=i
-                    inf=False
+            k += 1
+        if not available:
+            self.available_executer[i]=False
 
-            values.append(value)
-            k+=1
-
-        if inf:
-            if nw is not None:
+        if ~self.weights.mask[i]:
+            if (next_well is not None) and (ck is not None):
                 k = ck
-                self.infmask[k] = True
-                self.infindex[k] = i
-                inf = False
-                values[k]=cv
+                self.weights.setinf(i=i, j=k, value=cv)
 
-                self.dt[k]=dt
             else:
-                self.check_infty(np.array(values), i)
+                if not self.tracing:
+                    k=0
+                    while k<allowed.shape[0]:
+                        if allowed[k]:
+                            j = self.free[k]
+                            func = self.debit_functions[j]
+                            if not func.cs:
+                                tmax = self.solved_time(other=j, current=cw,current_index=i,
+                                                        set_blocked=True, tracing=self.tracing)
+                                value = self.fun(x=tmax, fun=func)
+                                if self.log.record:
+                                    log.vector[j].eval = value
+                                if ~np.isinf(value):
+                                    self.weights[i,k] = value
+                                    ninf.append(k)
+                        k+=1
+                self.weights.swap(i,np.array(ninf,dtype=np.int32))
+        if self.log.record:
+            self.log.close()
+        return valid
+    def get_time(self,other, current, current_index, func, tracing=False):
+        x = self.ts[current, other]+self.ct[current_index]
+        if tracing:
+            x=self.set_bound(x, func)
+        if x is None:
+            return x
+        x=self.get_group_support(x, current_index)
+        return x
 
-        if array:
-            return np.array(values).reshape(1,-1)
+    def penalty(self,other, current, current_index, func):
+        y = self.ts[current, other]+self.ct[current_index]
+        x=self.set_bound(y, func)
+        x=self.get_group_support(x, current_index)
+        penalty=min(y-func.supp[0],0)
+        return penalty
+
+    def solved_time(self,other, current, current_index, tracing=False,set_blocked=False,span_=None,return_inspan=False):
+        # expected span_=(span,target)
+        def get_block(fun):
+            a=[]
+            for k in fun.prohibits:
+                t1=self.debit_functions[k].t1
+                t2 = self.debit_functions[k].t2
+                a.append([t1,t2])
+            return np.array(a).reshape(-1,2)
+
+        def get_unblocked_time(x,func_):
+            block_=get_block(func_)
+            r=np.array([x,np.inf])
+            free=op.residual(r,block_)
+            amin=op.inspan(x,free,epsilon=self.tolerance,include='left',length=func_.tau,subset=True)
+            if not ((amin>=func_.supp[0])&(amin<=func_.supp[1])):
+                amin=None
+            return amin
+
+        x=None
+        y=None
+        func = self.debit_functions[other]
+        if tracing:
+            set_blocked=True
+            return_inspan=False
+
+        x = self.get_time(other=other, current=current, current_index=current_index, func=func, tracing=tracing)
+        if x is None:
+            if return_inspan:
+                return x, y
+            else:
+                return x
+
+
+        if set_blocked:
+            x=get_unblocked_time(x,func)
         else:
-            return values
+            block = get_block(func)
+            isblocked=op.inset(x,block,epsilon=self.tolerance)
+            if isblocked:
+                x=None
+            if x is None:
+                if return_inspan:
+                    return x,y
+                else:
+                    return x
+
+        if tracing:
+            return x
+
+        if span_ is None:
+            span,target=self.get_span(current_index,return_next=True)
+        else:
+            span=span_[0]
+            target=span_[1]
+
+        if return_inspan:
+            if target is not None:
+                xhat=x+func.tau+self.ts[other,target]
+                y=op.inspan(xhat,span,epsilon=self.tolerance)
+            else:
+                y=x
+            return x,y
+
+        return x
 
 
     def f0(self,x=0.,fun=debit_function()):
@@ -1152,7 +2521,13 @@ class wells_schedule:
         else:
             y=np.NINF
         return y
-
+    def f15(self,x=0.,fun=debit_function()):
+        # ранжирование по дебиту
+        if (x>=fun.supp[0])&(x<=fun.supp[1]):
+            return fun.tail(x)
+        else:
+            y=np.NINF
+        return y
 
     def f7(self,x=0.,fun=debit_function()):
         teta=fun.supp[0]-x
@@ -1174,7 +2549,7 @@ class wells_schedule:
             if teta<=fun.supp[1]:
                 return teta
             else:
-                return np.inf
+                return None
 
     def f8(self,x=0.,fun=debit_function()):
         teta=fun.supp[1]-x
@@ -1258,7 +2633,6 @@ class wells_schedule:
                     k += 1
                 #if n > 0:
                 self.logistic_values[i]=sum
-
                 i+=1
 
         if self.logistic_values is None:
@@ -1275,9 +2649,91 @@ class wells_schedule:
             n=self.free.shape[0]-1
             if n>0:
                 return -(t+self.logistic_values[cw]/n)
-            else: return -t
+            else:
+                return -t
 
-    def update_logistic_values(self, indices=np.array([])):
+    def f18(self,x=0.,fun=debit_function(),penalty=0):
+        #ранжирование по логистике
+        # i - номер группы
+        def set_log_values():
+            stop=self.free.shape[0]
+            self.logistic_values=np.zeros(shape=stop)
+            i=0
+            while i<self.logistic_values.shape[0]:
+                cw=self.free[i]
+                k = 0
+                sum=0.
+                n=0
+                while k < stop:
+                    j = self.free[k]
+                    if j != cw:
+                        value =self.ts[cw, j] - self.debit_functions[j].supp[1]
+                        sum += value
+                        n += 1
+                    k += 1
+                #if n > 0:
+                self.logistic_values[i]=sum
+                i+=1
+
+        if self.logistic_values is None:
+            set_log_values()
+            value=self.f18(x,fun)
+            return value
+        else:
+            #teta = self.set_bound(x, fun=fun)
+            #teta=x
+            if np.isinf(x):
+                return np.NINF
+            cw = fun.current_index
+            t = x + fun.tau-penalty
+            n=self.free.shape[0]-1
+            if n>0:
+                return -(t+self.logistic_values[cw]/n)
+            else:
+                return -t
+
+    def f18c(self,x=0.,fun=debit_function(),penalty=0):
+        #ранжирование по логистике
+        # i - номер группы
+        def get_value(fun=debit_function()):
+            sum=0
+            k=0
+            cw=fun.index
+            while k<self.free.shape[0]:
+                well=self.free[k]
+                func=self.debit_functions[well]
+                if (cw!=well)&(func.opened):
+                    value = self.ts[cw, well] - func.supp[1]
+                    sum+=value
+                k+=1
+            return sum
+        def set_log_values():
+            stop=self.free.shape[0]
+            self.logistic_values=np.zeros(shape=stop)
+            i=0
+            while i<self.logistic_values.shape[0]:
+                cw=self.free[i]
+                value=get_value(self.debit_functions[cw])
+                self.logistic_values[i]=value
+                i+=1
+
+        if self.logistic_values is None:
+            set_log_values()
+            value=self.f18c(x,fun)
+            return value
+        else:
+
+            if (not fun.opened)|(not op.isin2(x,fun.supp,epsilon=self.tolerance))|np.isinf(x):
+                return np.NINF
+            cw = fun.current_index
+            t = x + fun.tau-penalty
+            n=self.opened_count-1
+
+            if n>0:
+                return -(t+self.logistic_values[cw]/n)
+            else:
+                return -t
+    def update_logistic_values(self, indices=np.array([]),incoming=dict()):
         def get_values(i=0,indices=np.array([])):
             sum=0
             for j in indices:
@@ -1287,7 +2743,14 @@ class wells_schedule:
                 sum += value
             return sum
 
-        if (self.logistic_values is None)|(indices.shape[0]==0):
+        if self.logistic_values is None:
+            return
+
+        if len(incoming)>0:
+            self.set_compact(incoming)
+
+
+        if indices.shape[0]==0:
             return
 
         k=0
@@ -1301,6 +2764,134 @@ class wells_schedule:
                 self.logistic_values[k]=self.logistic_values[k]-value
             k+=1
         self.logistic_values=self.logistic_values[mask]
+        self.opened_count-=indices.shape[0]
+
+    def reset_compact(self,cortege):
+        def value(i=0,index=np.array([])):
+            sum=0
+            for j in index:
+                if i==j:
+                    return None
+                val=self.ts[i,j]-self.debit_functions[j].supp[1]
+                sum+=val
+            return sum
+        if not (type(cortege)==Cortege):
+            return
+        if not cortege.isopened():
+            return
+
+        bounds=cortege.bounds
+        index = np.array(list(bounds.keys()))
+        self.opened_count -= index.shape[0]
+        i=0
+        while i<self.free.shape[0]:
+            cw=self.free[i]
+            val=value(cw,index)
+            if val is not None:
+                if self.logistic_values is None:
+                    y=self.fun(x=0,fun=self.debit_functions[cw])
+                self.logistic_values[i]-=val
+            i+=1
+        for k in bounds.keys():
+            self.debit_functions[k].reset_cortege()
+            self.support[k,[0,1]]=np.nan
+            self.added-=1
+            self.localy_added-=1
+            #self.opened_activities.remove(k)
+        cortege.reset()
+
+    def set_compact(self,bounds=dict({0:np.array([0,np.inf])})):
+        def value(i=0,index=np.array([])):
+            sum=0
+            for j in index:
+                if i==j:
+                    return None
+                val=self.ts[i,j]-self.debit_functions[j].supp[1]
+                sum+=val
+            return sum
+
+        def realise_executors(activities=np.array([],dtype=np.int32)):
+            i=0
+            while i<self.ftmatrix.shape[1]:
+                if self.executors[i].paused:
+                    for a in activities:
+                        if self.ftmatrix[a,i]:
+                            self.executors[i].paused=False
+                            break
+                i+=1
+
+
+        for k in bounds.keys():
+            supp=bounds[k]
+            func=self.debit_functions[k]
+            func.supp=supp
+            func.opened=True
+            self.support[k,0]=supp[0]
+            self.support[k, 1] = supp[1]
+            self.added+=1
+            self.localy_added+=1
+            self.opened_activities.append(k)
+            #print('opened ',k,supp)
+        index=np.array(list(bounds.keys()))
+        realise_executors(activities=index)
+        i=0
+        while i<self.free.shape[0]:
+            cw=self.free[i]
+            val=value(cw,index)
+            if val is not None:
+                if self.logistic_values is None:
+                    y=self.fun(x=0,fun=self.debit_functions[cw])
+                self.logistic_values[i]+=val
+            i+=1
+        self.opened_count+=index.shape[0]
+
+    def open_compact_old(self,cw=0,t1=0,t2=0):
+        try:
+            cortege_name=self.corteges_index[cw]
+
+            cortege=self.corteges[cortege_name]
+            if not cortege.isopened():
+                cortege.apply = cortege.get_position()
+                cortege.apply(t1, t1)
+                self.set_compact(cortege.bounds)
+                self.opened_corteges+=1
+                for e in self.executors.keys():
+                    self.executors[e].apply(cortege_name)
+
+            bounds=cortege.current.apply(cw,t1,t2)
+            if bounds is not None:
+                cortege.apply(bounds[0], bounds[1])
+                return cortege.bounds
+
+        except KeyError:
+            return None
+
+    def open_compact(self,cw=0,t1=0,t2=0):
+        try:
+            cortege_name=self.corteges_index[cw]
+            cortege=self.corteges[cortege_name]
+            if not cortege.isopened():
+                bounds=cortege.Apply(t1,t1)
+                self.set_compact(bounds)
+                self.opened_corteges+=1
+                for e in self.executors.keys():
+                    self.executors[e].apply(cortege_name)
+            bounds=cortege.Apply(t1,t2,cw)
+            if bounds is not None:
+                self.set_compact(bounds)
+            return
+
+        except KeyError:
+            return
+
+
+
+
+
+
+
+
+
 
 
 
@@ -1333,29 +2924,19 @@ class wells_schedule:
         #t1 = time.perf_counter()
         #i_=15
         if (not self.tracing) & self.permutation:
-            #w1=self.routes[self.current_index[i_],self.current_indey[i_]]
-            #if w1==56:
-                #print()
-            #print(self.routes[self.current_index[i_],self.current_indey[i_]])
             weigth,sindex=self.get_route_weigths()
-            #for tet in np.arange(weigth.shape[0]):
-                #val=weigth[tet,tet]
-                #if np.isinf(val):
-                    #print()
-            #li_=np.where(sindex==i_)[0][0]
+
             if weigth.shape[0]>0:
-                localswap, s = self.function(weigth, criterion='min', engine=self.engine)
+                localswap, s = self.function(weigth, criterion='max', engine=self.engine)
+                #localswap, s = self.function(weigth, criterion='min', engine=self.engine)
                 swap=sindex[localswap[1]]
                 self.current_index[sindex]=self.current_index[swap]
                 self.current_indey[sindex] = self.current_indey[swap]
-            #w2=self.routes[self.current_index[i_],self.current_indey[i_]]
-
-            #print('cpl',self.groups[i_],w1,'-->',w2,' wigth=',weigth[li_,sli_],"ct",self.ct[i_],"st",self.st[i_],'shape',weigth.shape)
 
 
         vectors=self.get_weights(indices=indices)
-        #t2 = time.perf_counter()
-        #self.wtime += (t2-t1)
+
+
         if vectors is  None:
             return None
 
@@ -1372,16 +2953,12 @@ class wells_schedule:
             self.nempty=taken[1].copy()
             taken[1]=index
 
-        mask=self.block(taken)
-        taken=taken[:,mask]
-        self.nempty=self.nempty[mask]
+        #mask=self.block(taken)
+        #taken=taken[:,mask]
+        #self.nempty=self.nempty[mask]
 
         if self.transpose:
             self.transpose = False
-
-        #print(self.free.shape)
-        #print('-----------------------')
-
 
         return taken,s
 
@@ -1432,9 +3009,9 @@ class wells_schedule:
         y_index = self.groups[x_index]  # -номера скважин, на которых находятся бригады x_index
 
         if self.transpose:
-            values = self.weights.T[x_index, indices[1]]
+            values = self.weights.array.T[x_index, indices[1]]
         else:
-            values = self.weights[x_index, indices[1]]
+            values = self.weights.array[x_index, indices[1]]
 
         m_index=self.free[indices[1]]
         #m_index=self.unical[indices[1]]
@@ -1450,9 +3027,16 @@ class wells_schedule:
                     for i, j in enumerate(index):
                         val = values[j]
                         w = m_index[j]
+                        #if (w==1143)|(w==1113):
+                            #print()
                         cw = y_index[j]
                         ci = x_index[j]
-                        t1_ = self.ct[ci] + self.ts[cw, w] + self.dt[ci]
+                        func=self.debit_functions[w]
+
+                        t1_ = self.get_time(other=w, current=cw,
+                                          current_index=ci, func=func,
+                                          tracing=self.tracing)
+                        #t1_ = self.ct[ci] + self.ts[cw, w] + self.dt[ci]
                         t2_ = t1_ + self.tr[w]
                         vector[0, i] = val
                         vector[1, i] = t1_
@@ -1464,8 +3048,10 @@ class wells_schedule:
 
             k+=1
         return mask
+
+
     def update_bounds(self, fun=debit_function()):
-        bounds=np.array([fun.t1,fun.t2],dtype=np.float16)
+        bounds=np.array([fun.t1,fun.t2],dtype=np.float64)
         for p in fun.prohibits:
             try:
                 cfun=self.debit_functions[p]
@@ -1475,82 +3061,168 @@ class wells_schedule:
 
 
     def update(self,indices=np.array([]),s=0):
+        def check4reset(index):
+            def check(index):
+                removable=[]
+                for w in index:
+                    fun=self.debit_functions[w]
+                    for e in self.numbers[self.available_executer]:
+                        if self.ftmatrix[w,e]:
+                            t=self.ct[e]
+                            if t>fun.supp[1]:
+                                removable.append(w)
+                return removable
+            removable=check(index)
+            self.opened.remove(removable)
+
+            for i in removable:
+                cortege_name=self.corteges_index[i]
+                if (cortege_name is None):
+                    continue
+                cortege=self.corteges[cortege_name]
+                if cortege.confirm:
+                    continue
+                self.reset_compact(cortege)
+            return
+
         index=self.free[indices[1]]
-        self.update_schedule(index=index)
         self.cd=self.cd+s
-        if index.shape[0]<self.groups.shape[0]:
-            index_x=np.empty(self.groups.shape[0], dtype=int)
-            index_y=np.empty(self.groups.shape[0], dtype=np.float32)
-            index_z=np.empty(self.groups.shape[0], dtype=np.float32)
-            index_w = np.zeros(self.groups.shape[0], dtype=int)
-            index_x.fill(-1)
-            index_y.fill(-1)
-            index_z.fill(-1)
-            sa=np.argsort(self.nempty)
-            #si=index[sa]
-            #sne=self.nempty[sa]
-            index_x[self.nempty[sa]] = index[sa]
+        mask=np.zeros(index.shape[0],dtype=bool)
+        index_x=np.empty(self.groups.shape[0], dtype=int)
+        index_y=np.empty(self.groups.shape[0], dtype=np.float32)
+        index_z=np.empty(self.groups.shape[0], dtype=np.float32)
+        index_w = np.zeros(self.groups.shape[0], dtype=int)
+        index_x.fill(-1)
+        index_y.fill(-1)
+        index_z.fill(-1)
 
-            for i,w in enumerate(index):
-                j=self.nempty[i]
-                st=self.ct[j] + self.ts[self.groups[j], w]+self.dt[j]
-                self.st[j] =self.get_group_support(st,j)
-                self.dt[j]=0
+        #в первую очередь обходим мероприятия, выбранные в результате кастинга
+        #source=self.available_executer[self.available_executer].shape[0]
+        #self.source=0
+        injected=0
+        self.localy_added = 0
+
+        for i,w in enumerate(index):
+            j=self.nempty[i]
+            if self.tracing & self.executors[j].injected:
+                injected+=1
+                continue
+
+            current_well=self.groups[j]
+            fun = self.debit_functions[w]
+            set_blocked=True
+            #if fun.cs:
+                #set_blocked=False
+
+
+            st = self.solved_time(other=w, current=current_well, current_index=j,
+                                    set_blocked=set_blocked, tracing=self.tracing)
+
+            if st is not None:
+                if fun.cs:
+                    st=max(st,fun.t1)
+
+                self.st[j] =st
                 self.ct[j] = self.st[j] + self.tr[w]
-                fun=self.debit_functions[w]
                 fun.used=True
+                mask[i] = True
+                self.source+=1
                 fun.t1=self.st[j]
                 fun.t2=self.ct[j]
-                self.update_bounds(fun)
+                self.open_compact(w,fun.t1, fun.t2)
+                self.opened.remove(w)
+                #bounds=self.open_compact(fun.t1,fun.t2,w)
+                #if bounds is not None:
+                    #self.set_compact(bounds)
 
+        # во вторую очередь обходим мероприятия, назначенные принудительно и инициирующие кортеж
 
-            index_y[:]=self.st
-            index_z[:]=self.ct
-            #index=index_x
-        else:
-            index_w = np.zeros(index.shape[0], dtype=int)
-            for i,w in enumerate(index):
+        if self.tracing:
+         for i,w in enumerate(index):
                 j=self.nempty[i]
-                #if w==263:
-                    #print()
-                st=self.ct[j] + self.ts[self.groups[j], w]+self.dt[j]
-                self.st[j] =self.get_group_support(st,j)
-                #self.st[j] = self.ct[j] + self.ts[self.groups[j], w]+self.dt[j]
-                self.ct[j] = self.st[j] + self.tr[w]
-                self.dt[j] = 0
-                fun=self.debit_functions[w]
-                fun.used=True
-                fun.t1=self.st[j]
-                fun.t2=self.ct[j]
-                self.update_bounds(fun)
+                if self.tracing & (not self.executors[j].injected):
+                    continue
+                self.executors[j].paused = False
+                self.executors[j].injected=False
+                current_well=self.groups[j]
+                fun = self.debit_functions[w]
+                set_blocked=True
 
-            index_y=self.st.copy()
-            index_z=self.ct.copy()
-            index_x=index[self.nempty]
+                st = self.solved_time(other=w, current=current_well, current_index=j,
+                                        set_blocked=set_blocked, tracing=self.tracing)
 
+                if st is not None:
+                    if fun.cs:
+                        st=max(st,fun.t1)
+
+                    self.st[j] =st
+                    self.ct[j] = self.st[j] + self.tr[w]
+                    fun.used=True
+                    #self.localy_added-=1
+                    mask[i] = True
+                    fun.t1=self.st[j]
+                    fun.t2=self.ct[j]
+                    self.open_compact(w,fun.t1, fun.t2)
+                    self.opened.remove(w)
+                    #print('taken ',w)
+                    #bounds=self.open_compact(w,fun.t1,fun.t2)
+                    #if bounds is not None:
+                        #self.set_compact(bounds)
+
+
+
+        index_y[:]=self.st
+        index_z[:]=self.ct
+        #index_y=self.st.copy()
+        #index_z=self.ct.copy()
+        #index_x=index[self.nempty]
+
+
+
+        assert mask[mask==True].shape[0]>0,"No one activities has been taken!"
+
+        index=index[mask]
+        #print('recorded=',index.shape[0])
+        opened=np.array(self.opened_activities,dtype=np.int32)
+        self.percent=0
+        if self.opened_previous.shape[0]>0:
+            ma=np.isin(self.opened_previous,index)
+            self.percent = ma[ma].shape[0] / ma.shape[0]
+        self.opened_previous=opened
+
+
+        self.opened_activities=[]
+        self.nempty=self.nempty[mask]
+        indices=indices[:,mask]
+        self.update_schedule(index=index)
+        self.update_logistic_values(indices=index)
+        index_x[self.nempty] = index
         self.groups[self.nempty]=index
         self.mask=np.ones(self.free.shape[0],dtype=bool)
-        self.mask[indices[1]]=0
-        #self.mask=self.wells[1]==1
+        self.mask[indices[1]]=False
         self.free=self.free[self.mask]
+        self.available_activities=np.zeros(shape=self.stop,dtype=bool)
         self.infmask = np.zeros(shape=self.stop, dtype=bool)
         self.infindex = np.zeros(shape=self.stop, dtype=np.int32)
-        self.minct = self.ct.min()
-        self.maxct=self.ct.max()
-        #self.free=self.sindices[self.mask]
-        #self.trajectories.append([index,(self.st,self.ct)])
+        self.minct = self.ct[self.available_executer].min()
+        self.maxct=self.ct[self.available_executer].max()
         self.trajectories.append([index_x,(index_y,index_z,index_w)])
+        check4reset(self.opened)
 
     def update_schedule(self,index=np.array([])):
         if self.routes is not None:
             k=0
             for i in self.nempty:
+
                 ci=self.current_index[i]
                 yci = self.current_indey[i]
                 if ci<self.routes.shape[0]:
                     well=self.routes[ci,yci]
                     taken=index[k]
+
                     if taken==well:
+                        #if well==1796:
+                            #print()
                         self.current_index[i]=ci+1
                 k+=1
 
@@ -1570,121 +3242,6 @@ class wells_schedule:
             return True, current
         else:
             return False,current
-
-
-
-
-    def update_tracing(self,indices=np.array([]),s=0):
-        index=self.free[indices[1]]
-        self.update_schedule(index=index)
-        self.mask=np.ones(self.free.shape[0],dtype=bool)
-        self.mask[indices[1]]=0
-        #print(index)
-        self.cd=self.cd+s
-        if index.shape[0]<self.groups.shape[0]:
-            index_x=np.empty(self.groups.shape[0], dtype=int)
-            index_y=np.empty(self.groups.shape[0], dtype=np.float32)
-            index_z=np.empty(self.groups.shape[0], dtype=np.float32)
-            index_w = np.zeros(self.groups.shape[0], dtype=int)
-            index_x.fill(-1)
-            index_y.fill(-1)
-            index_z.fill(-1)
-            #index_w.fill(0)
-            index_x[self.nempty] = index
-
-            for i,w in enumerate(index):
-                j=self.nempty[i]
-                point=self.ct[j]+self.ts[self.groups[j],w]
-                #point=self.get_group_support(point)
-                fun=self.debit_functions[w]
-                if point<=fun.supp[0]:
-                    st=fun.supp[0]
-                    st=self.get_group_support(st,j)
-                    self.st[j]=st
-                    self.ct[j] = self.st[j]+self.tr[w]
-                    fun.used = True
-                    fun.t1 = self.st[j]
-                    fun.t2 = self.ct[j]
-                    self.update_bounds(fun)
-                else:
-                    if point<=fun.supp[1]:
-                        st=self.get_group_support(point,j)
-                        self.st[j] = st
-                        self.ct[j] = self.st[j] + self.tr[w]
-                        fun.used = True
-                        fun.t1 = self.st[j]
-                        fun.t2 = self.ct[j]
-                        self.update_bounds(fun)
-                    else:
-                        self.st[j] = np.nan
-                        self.ct[j] = np.nan
-
-                state,current=self.update_queue(w)
-                if current>0:
-                    index_w[j] = current-1
-
-                if state:
-                    s = indices[1][i]
-                    self.mask[s]=1
-
-
-            index_y[:]=self.st
-            index_z[:]=self.ct
-            #index=index_x
-        else:
-
-            index_w = np.zeros(index.shape[0], dtype=int)
-            for i,w in enumerate(index):
-
-                #if (w==263):
-                    #print()
-
-                j=self.nempty[i]
-                point=self.ct[j]+self.ts[self.groups[j],w]
-                fun=self.debit_functions[w]
-                if point<=fun.supp[0]:
-                    st=fun.supp[0]
-                    self.st[j]=self.get_group_support(st,j)
-                    self.ct[j] = self.st[j]+self.tr[w]
-                    fun.used = True
-                    fun.t1 = self.st[j]
-                    fun.t2 = self.ct[j]
-                    self.update_bounds(fun)
-                else:
-                    if point<=fun.supp[1]:
-                        st=self.get_group_support(point,j)
-                        self.st[j] = st
-                        self.ct[j] = self.st[j] + self.tr[w]
-                        fun.used = True
-                        fun.t1 = self.st[j]
-                        fun.t2 = self.ct[j]
-                        self.update_bounds(fun)
-                    else:
-                        self.st[j] = np.nan
-                        self.ct[j] = np.nan
-
-                state, current = self.update_queue(w)
-                if current>0:
-                    index_w[j] = current-1
-
-                if state:
-                    s=indices[1][i]
-                    self.mask[s]=1
-
-
-            index_y=self.st.copy()
-            index_z=self.ct.copy()
-            index_x=index[self.nempty]
-
-        self.groups[self.nempty]=index
-        self.update_logistic_values(index)
-        self.free=self.free[self.mask]
-        self.infmask = np.zeros(shape=self.stop, dtype=bool)
-        self.infindex = np.zeros(shape=self.stop, dtype=np.int32)
-        self.minct=self.ct.min()
-        self.maxct = self.ct.max()
-        self.trajectories.append([index_x,(index_y,index_z,index_w)])
-
 
     def isvalid(self,igroup,well):
         fun=self.debit_functions[well]
@@ -1711,19 +3268,86 @@ class wells_schedule:
 
 
     def get_routes(self):
+        self.counter=0
+        self.counters.update({"niter":[],"free":[],"opened":[],"executers":[],"opened_act":[],
+                              "added":[],"percent":[],"time":[]})
+        try:
 
-        while self.free.shape[0]>0:
-            res=self.get_optimized_trajectories(self.numbers)
-            if res is None:
-                break
-            indices=res[0]
-            s=res[1]
+            while self.free.shape[0]>0:
+                #self.opened_activities = []
+                res=self.get_optimized_trajectories(self.numbers[self.available_executer])
+                self.counter+=1
+                self.counters["niter"].append(self.counter)
+                self.counters["free"].append(self.free.shape[0])
+                self.counters["opened"].append(self.opened_corteges)
+                self.counters["opened_act"].append(self.opened_count)
+                self.counters["executers"].append(self.available_executer[self.available_executer].shape[0])
+                self.counters["added"].append(self.added)
+                self.counters["percent"].append(self.percent)
+                self.counters['time'].append([self.ct.copy(),self.opened_previous])
+                self.added=0
 
-            if self.tracing:
-                self.update_tracing(indices,s)
-            else:
+                #print(self.counter,self.free.shape,self.opened_corteges,self.available_executer[self.available_executer].shape)
+                if res is None:
+                    break
+                indices=res[0]
+                s = res[1]
                 self.update(indices,s)
-        return self.trajectories
+
+
+            return self.trajectories
+        except AssertionError:
+            if self.log.record:
+                with open(os.path.join(os.getcwd(),'log.sav'),'wb') as file:
+                    pickle.dump(self.log,file)
+
+    def update_restrictions(self,index=np.array([],dtype=np.int32)):
+        if index.shape[0]==0:
+            return
+        for k in index:
+            i=0
+            while i<self.routes.shape[1]:
+                if not self.ftmatrix[k,i]:
+                    i+=1
+                    continue
+                j=0
+                while j<self.routes.shape[0]:
+                    well=self.routes[j,i]
+                    self.prohibits[k,well]=False
+                    if well<0:
+                        break
+                    j+=1
+                i+=1
+
+    def to_date(self,sdate=np.datetime64('2023-01-01'),R=np.array([]),T=np.array([]),D=np.array([])):
+        diction=dict({})
+        i=0
+        while i<R.shape[1]:
+            j=0
+            while j<R.shape[0]:
+                act=R[j,i]
+                if act<0:
+                    break
+                t1=D[j,i]
+                t2=T[j,i]
+                t1_=dts(t1)
+                t2_=dts(t2)
+                sd=sdate+pd.DateOffset(seconds=t1_)
+                ed = sdate + pd.DateOffset(seconds=t2_)
+
+                try:
+                    q0=self.Q0[act]
+                    q1=self.Q1[act]
+                except IndexError:
+                    q0 = 0
+                    q1 = 0
+                diction[act]=dict({'exec':i,"begin":sd,"end":ed,"q0":q0,"q1":q1})
+
+                j+=1
+
+            i+=1
+        return diction
+
 
 
 
@@ -1872,6 +3496,28 @@ def get_distances(data,fields,well='ID',field='Месторождение'):
             zeros[j,i]=fd+6
     return pd.DataFrame(data=zeros,index=index,columns=index)
 
+
+def get_distances_by_coordinates(data=np.array([[0,0]])):
+    if data.shape[0]<=1:
+        return np.array([0])
+    distances=np.zeros(shape=(data.shape[0],data.shape[0]))
+    i=0
+    while i<data.shape[0]:
+        latitude=data[i,0]
+        longtitude=data[i,1]
+        j=i+1
+        while j<data.shape[0]:
+            latitude_ = data[j, 0]
+            longtitude_ = data[j, 1]
+            d=cppmath.haversine(latitude,longtitude,latitude_,longtitude_)
+            #d = cppmath.distance(latitude,longtitude,latitude_, longtitude_)
+            distances[i, j] = d
+            distances[j, i] = d
+            j+=1
+        i+=1
+    return distances
+
+
 def set_unical_well_index(wells=np.array([]),index=np.array([])):
     indices=np.zeros(wells.shape[0],dtype=np.int32)
     for i,j in enumerate(index):
@@ -2006,6 +3652,519 @@ def set_loc_index(index=np.array([]), R=np.array([]), T=np.array([]), D=np.array
             j += 1
         i += 1
     return res
+
+class Item:
+    def __init__(self,index=0,a=0,b=0,alpha=0):
+        assert ((type(index)==int)|(type(index)==np.int16)|(type(index)==np.int32)|(type(index)==np.int64)),\
+            "index must be an integer"
+        self.index=index
+        assert (a>=0)&(b>=0)&(alpha>=0),"a,b and alpha must be not negative. error on  index "+str(self.index)
+        self.a=a
+        self.b=b
+        self.alpha=alpha
+        self.t1=0.
+        self.t2=0.
+        self.used=False
+    def set_bounds(self,x=0,xtau=0):
+        assert (x<=xtau),"left bound must be less or equal than right one "
+
+        if self.alpha==0:
+            t=x
+        else:
+            t=xtau
+
+        self.t1=t+self.a
+        self.t2=t+self.b
+
+        if self.t1>self.t2:
+            self.t1=self.t2
+
+        return self.t1,self.t2
+    def get_bounds(self,x=0,xtau=0):
+        assert (x<=xtau),"left bound must be less or equal than right one "
+
+        if self.alpha==0:
+            t=x
+        else:
+            t=xtau
+        t1=t+self.a
+        t2=t+self.b
+        if t1>t2:
+            t1=t2
+        return t1,t2
+
+class ListItems:
+    def __init__(self):
+        self.diction=dict()
+        self.index=dict()
+        self.count=0
+        self.current_index=0
+        self.applied_number=0
+        self.mint=np.inf
+        self.maxt=np.NINF
+
+    def insert(self,item=Item()):
+        assert isinstance(item,Item),"allowed only Item type"
+        try:
+            self.diction[item.index]
+        except KeyError:
+            self.diction[item.index]=item
+            self.index[self.get_count()-1]=item.index
+
+    def apply(self,index,t1=0,t2=0):
+        try:
+            item=self.diction[index]
+            if not item.used:
+                self.applied_number+=1
+                item.used=True
+            if t1<self.mint:
+                self.mint=t1
+            if t2>self.maxt:
+                self.maxt=t2
+            if self.is_done():
+                return np.array([self.mint,self.maxt])
+            else:
+                return None
+        except IndexError:
+            pass
+
+    def __iter__(self):
+        self.count=len(self.index)
+        self.current_index=0
+        return self
+
+    def __next__(self):
+        if self.current_index<self.count:
+            j=self.index[self.current_index]
+            val=self.diction[j]
+            self.current_index+=1
+            return val
+        else:
+            raise StopIteration
+
+    def __getitem__(self, item):
+        try:
+            val=self.diction[item]
+            return val
+        except KeyError:
+            return None
+
+    def iloc(self, index=0):
+        assert ((type(index) == int) | (type(index) == np.int16) | (type(index) == np.int32) | (type(index) == np.int64)),\
+            "index must be an integer"
+        try:
+            i=self.index[index]
+            return self.diction[i]
+        except KeyError:
+            return None
+
+
+    def get_count(self):
+        return len(self.diction)
+
+    def set_bounds(self,x=0,xtau=0):
+        assert (x <= xtau), "left bound must be less or equal than right one "
+        res=dict()
+        for key in self.diction.keys():
+            item=self.diction[key]
+            item.set_bounds(x=x,xtau=xtau)
+            res.update({key:np.array([item.t1,item.t2])})
+        return res
+
+    def get_bounds(self,x=0,xtau=0):
+        assert (x <= xtau), "left bound must be less or equal than right one "
+        res=dict()
+        for key in self.diction.keys():
+            item=self.diction[key]
+            t1,t2=item.get_bounds(x=x,xtau=xtau)
+            res.update({key:np.array([t1,t2])})
+        return res
+    def is_done(self):
+        if self.applied_number<self.get_count():
+            return False
+        else:
+            return True
+
+
+
+class Cortege:
+    def __init__(self):
+        self.position=dict()
+        self.position_index=-1
+        self.iloc=dict()
+        self.groupby='position'
+        self.columns=['cortege_activity_id', 'position',
+                      'begin_from', 'begin_to','from_end']
+        self.index=0
+        self.bounds=dict()
+        self.current=dict()
+        self.apply=dict()
+        self.dQsum=0
+        self.dTausum=0
+        self.n=0
+        self.reserved=False
+        self.confirm=False
+
+    def val(self,t):
+        return (t-self.dTausum)*self.dQsum
+    def reset(self):
+        self.bounds=dict()
+        self.position_index=-1
+        self.current=dict()
+        self.apply=dict()
+        self.queue=dict()
+        self.reserved=False
+        self.confirm=False
+    def insert(self,key=0,val=ListItems()):
+        assert isinstance(val,ListItems)
+        self.position[key]=val
+    def fit(self,index=0,labels=np.array([],dtype=np.int32),data=pd.DataFrame([])):
+        self.index=index
+        val = data.loc[labels,['Q1','Q0','duration']].values
+        self.dTausum=val[:,2].sum()
+        dq=val[:,0]-val[:,1]
+        self.dQsum=dq.sum()
+        self.n=labels.shape[0]
+        groups=data.loc[labels,self.columns].groupby(self.groupby).groups
+        for iloc,key in enumerate(groups.keys()):
+            Li = ListItems()
+            indices=groups[key]
+            for i in indices:
+                a=data.at[i,'begin_from']
+                b = data.at[i,'begin_to']
+                alpha = data.at[i,'from_end']
+                item = Item(index=i,a=a,b=b,alpha=alpha)
+                Li.insert(item)
+            self.position[int(key)]=Li
+            self.iloc[iloc]=int(key)
+
+    def Apply(self,x=0,xtau=0,cw=None):
+        if  cw is None:
+            self.queue=self.get_position()
+            self.queue(x,xtau)
+            return self.bounds
+        else:
+            self.confirm=True
+            bounds=self.current.apply(cw,x,xtau)
+            if bounds is not None:
+                self.queue(bounds[0],bounds[1])
+                return self.bounds
+            else:
+                return None
+
+    def get_position(self):
+        mapped = map(lambda x: self.position[x], self.position.keys())
+        def value(x=0,xtau=0):
+            try:
+                fun=next(mapped)
+                self.position_index+=1
+                self.bounds=fun.set_bounds(x=x,xtau=xtau)
+                self.current=fun
+                #return fun
+            except StopIteration:
+                self.bounds=None
+        return value
+    def count(self):
+        return len(self.position)
+    def isopened(self):
+        if type(self.current)==ListItems:
+            return True
+        else:
+            return False
+    def get_bounds(self,iloc=0):
+        def init():
+            self.iloc=dict()
+            for i,k in enumerate(self.position.keys()):
+                self.iloc[i]=k
+        res=dict()
+        try:
+            try:
+                key=self.iloc[iloc]
+            except AttributeError:
+                init()
+                key = self.iloc[iloc]
+            for k in self.position[key].diction.keys():
+                res[k]=(self.position[key].diction[k].a,self.position[key].diction[k].b)
+
+            return res
+        except KeyError:
+            return res
+        except IndexError:
+            return res
+
+
+    def get_activities(self,iloc=0):
+        def init():
+            self.iloc=dict()
+            for i,k in enumerate(self.position.keys()):
+                self.iloc[i]=k
+        try:
+            try:
+                key=self.iloc[iloc]
+            except AttributeError:
+                init()
+                key = self.iloc[iloc]
+
+            activities=list(self.position[key].diction.keys())
+            return np.array(activities,dtype=np.int32)
+        except KeyError:
+            return np.array([],dtype=np.int32)
+        except IndexError:
+            return np.array([],dtype=np.int32)
+    def ifapply(self,activity=0,stime=0,etime=0):
+        if not self.isopened():
+            return None
+        activities=self.current.diction.keys()
+        if ~np.isin(activity,list(activities)):
+            return None
+        if self.position_index+1<self.count():
+            next_index=self.iloc[self.position_index+1]
+            next_position=self.position[next_index]
+            bounds=next_position.get_bounds(stime,etime)
+            return bounds
+        else:
+            return None
+
+
+
+
+
+
+class Node:
+    def __init__(self):
+        self.index=0
+        self.type=-1
+        self.main_obj =0
+        self.value=0
+        self.tvalue = 0
+        self.qreserv=0
+        self.qout=0
+        self.flow_delay = 0
+        self.parents=[]
+        self.xoc_vals=np.array([])
+        self.dates=np.array([])
+        self.used=False
+        self.flow = False
+        self.inflow = False
+        self.impure= False
+        self.is_leaf=False
+        self.is_root = False
+
+class Tree:
+    def __init__(self,graph=dict()):
+        self.graph=dict()
+        self.leafs=[]
+    def get_leafs(self):
+        def go(node_id):
+            node = self.graph[node_id]
+            if len(node.parents) > 0:
+                for p in node.parents:
+                    try:
+                        self.graph[p].used = True
+                        #if not self.graph[p].used:
+                        go(p)
+
+
+                    except KeyError:
+                        pass
+            else:
+                node.is_root=True
+                return
+
+        for k in self.graph.keys():
+            if not self.graph[k].used:
+                go(k)
+        for k in self.graph.keys():
+            if not self.graph[k].used:
+                self.graph[k].is_leaf=True
+                self.leafs.append(k)
+
+    def get_flows(self):
+        flows=dict()
+        for leaf in self.leafs:
+            flow=self.get_flow(leaf)
+            flows.update({leaf:flow})
+        return flows
+
+    def get_flow(self,leaf):
+        def go(node_id):
+            nodes=[]
+            try:
+                node=self.graph[node_id]
+
+            except KeyError:
+                print("error ",node_id)
+                nodes.append(node_id)
+                return nodes
+
+            if (len(node.parents)>0) and (not node.used):
+                node.used = True
+                for p in node.parents:
+                    nodes_=go(p)
+                    if len(nodes_)>0:
+                        for n in nodes_:
+                            l=[node_id]
+                            if type(n)==list:
+                                l.extend(n)
+                            else:
+                                l.append(n)
+
+                            nodes.append(l)
+                    else:
+                        nodes.append(node_id)
+            else:
+                nodes.append(node_id)
+
+            return nodes
+        flow=go(leaf)
+        return flow
+
+class Events:
+    def __init__(self,events=np.array([]),size=30):
+        self.events=events
+        self.size=size
+        self.dtz=None
+        self.distr=np.zeros(shape=(2,self.size))
+        self.index=dict()
+        self.mean=0.
+        self.var=0.
+        self.var_log=[]
+    def fit(self):
+        distribution = np.histogram(self.events, bins=self.size,range=(self.events.min()-1,self.events.max()+1))
+        self.dtz = np.digitize(self.events, distribution[1],right=True)
+        k=0
+        while k<self.size:
+            self.index[k]=[]
+            k+=1
+        i=0
+        while i<self.dtz.shape[0]:
+            j=self.dtz[i]-1
+            s=self.events[i]
+            self.distr[0,j]+=s
+            self.index[j].append(i)
+            i+=1
+        self.mean=self.distr[0].mean()
+        self.distr[1,:]=self.distr[0,:]-self.mean
+        self.distr[1,:]=np.power(self.distr[1,:],2)
+        self.distr[1, :]=self.distr[1,:]/self.distr[1].shape[0]
+        self.var=self.distr[0].var()
+    def get_var(self,out,into,item=0):
+        sout=self.distr[0,out]
+        sin=self.distr[0,into]
+        return self.var+(2*item*(sin-sout)+2*item**2)/self.size
+
+    def get_optim_var(self,out,into,item=0):
+        var=self.get_var(out,into,item)
+        index=self.index[into]
+        minvar=var
+        move=None
+        for i in index:
+            val=self.events[i]
+            sout = self.distr[0, into]+item
+            sin = self.distr[0, out]-item
+            var_=var + (2 * val * (sin - sout) + 2 * val ** 2) / self.size
+            if var_<minvar:
+                minvar=var_
+                move=i
+        return minvar,move
+
+
+    def apply(self, out, into, index,backward=None):
+        item=self.events[index]
+        bitem=0
+        if backward is not None:
+            bitem = self.events[backward]
+            self.index[into].remove(backward)
+            self.index[out].append(backward)
+
+        item=item-bitem
+        self.distr[0, out]-=item
+        self.distr[0, into]+= item
+        self.index[out].remove(index)
+        self.index[into].append(index)
+
+
+
+    def eval(self):
+        go=True
+        mask=np.ones(shape=self.distr[0].shape[0],dtype=bool)
+        forward=True
+        j = -1
+        si=np.arange(self.size)
+        while go:
+
+            if forward:
+                mask.fill(True)
+                si = np.argsort(self.distr[0])
+                j=-1
+                forward=False
+            else:
+                j-=1
+
+            out = si[j]
+            mask[j]=False
+
+            possible=self.index[out]
+
+            i=0
+            while i<len(possible):
+                index=possible[i]
+                i+=1
+                item=self.events[index]
+                for k,into in enumerate(si):
+                    if ~mask[k]:
+                        continue
+                    var,backward=self.get_optim_var(out,into,item)
+                    if (var<self.var)&(abs(var-self.var)>1e-3):
+                        self.var=var
+                        #print(self.var)
+                        self.var_log.append(self.var)
+                        self.apply(out,into,index,backward)
+                        forward=True
+                        mask.fill(True)
+                        break
+
+            go=any(mask)
+
+
+    def eval_old(self):
+        go=True
+        mask=np.ones(shape=self.distr[0].shape[0],dtype=bool)
+        while go:
+            si = np.argsort(self.distr[0])
+            smask=mask[si]
+            out=si[smask][-1]
+            #out=np.argmax(self.distr[0,mask])
+            forward=False
+            possible=self.index[out]
+
+            i=0
+            while i<len(possible):
+                index=possible[i]
+                i+=1
+                item=self.events[index]
+                for into in si:
+                    if into==out:
+                        continue
+                    var,backward=self.get_optim_var(out,into,item)
+                    if (var<self.var)&(abs(var-self.var)>1e-3):
+                        self.var=var
+                        #print(self.var)
+                        self.var_log.append(self.var)
+                        self.apply(out,into,index,backward)
+                        forward=True
+                        mask.fill(True)
+                        break
+            if not forward:
+                mask[out]=False
+                #print(mask[mask].shape[0])
+
+            go=any(mask)
+
+
+
+
+
 
 
 #from importlib import reload
