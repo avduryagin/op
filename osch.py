@@ -1656,11 +1656,12 @@ class wells_schedule:
         cover=self.cover(executers)
         if len(cover.keys())==0:
             return False
-        self.opened.extend(cover.keys())
+
         for cid in cover.keys():
             cortege=cover[cid]
             execut = cortege[0][1]
             activities = cortege[0][0]
+            self.opened.extend(activities)
             weigth = cortege[1]
             t_ = weigth.min() * -1
             mct = self.ct[execut].min()
@@ -1754,34 +1755,36 @@ class wells_schedule:
         missed=[]
         #cco=0
         forw=True
-        open_=False
+        open_=True
         while forw:
+            set_tau_horizon(indices)
             #t1=time.perf_counter()
             empty=[]
             for i in indices:
                 ct = self.ct[i]
                 if ct - self.minct < tolerance:
                     eps=self.executors[i].epsilon+step
+                    valid=True
                     if not self.executors[i].paused:
                         valid=self.get_vector(i,eps=eps)
-
-                    if (self.tracing)&(not self.weights.mask[i]):
+                    if (self.tracing)&(not valid):
                         empty.append(i)
 
                 else:
                     missed.append(i)
-            if (len(empty)>0) & (not open_):
+            if (len(empty)>0) &(len(self.opened)==0) & open_:
+            #if (len(empty) > 0) & open_:
                 empty_=np.array(empty,dtype=np.int32)
-                assigned=self.try2open(empty_)
-                open_=True
-                if assigned:
-                    set_tau_horizon(indices)
-                    continue
+                open_=self.try2open(empty_)
+                #open_=True
+                #if assigned:
+                    #set_tau_horizon(indices)
+                continue
 
 
 
             self.nempty = self.weights.index[self.weights.mask]
-            nem=np.where(~np.isinf(self.weights.array.reshape(-1)))[0].shape[0]
+            #nem=np.where(~np.isinf(self.weights.array.reshape(-1)))[0].shape[0]
 
 
             if (self.nempty.shape[0]==0)&(not self.empty_executors())&(step<self.t):
@@ -2072,6 +2075,9 @@ class wells_schedule:
                 return np.NINF
         return function
     def get_opened_activities(self):
+        return np.array(self.opened,dtype=np.int32)
+
+    def get_opened_activities_old(self):
         opened = []
         for a in self.free:
             fun=self.debit_functions[a]
@@ -2093,7 +2099,10 @@ class wells_schedule:
                 if not self.ftmatrix[a,e]:
                     continue
                 cw=self.groups[e]
-                t=self.ct[e]+self.ts[cw,a]
+
+                t=self.solved_time(other=a,current=cw,current_index=e,tracing=self.tracing)
+                if t is None:
+                    continue
                 bounds=cortege.ifapply(a,t,t+tau)
                 if bounds is None:
                     continue
@@ -2144,7 +2153,9 @@ class wells_schedule:
 
 
         while k < self.stop:
+            valid_=False
             j = self.free[k]
+
             value=self.weights[i, k]
             if j==next_well:
                 ck=k
@@ -2168,17 +2179,22 @@ class wells_schedule:
                 if self.ct[i]>func.supp[1]:
                     k+=1
                     continue
-                if self.ct[i] + eps < func.supp[0]:
+                if (self.ct[i]<= func.supp[1]) and (self.ct[i] + eps >= func.supp[0]) and allow:
+                    valid_=True
+                    valid=valid or valid_
+                else:
                     k+=1
                     continue
-                else: valid = True
+
 
 
 
 
                 x=self.solved_time(other=j,current=cw,
                                 current_index=i,tracing=self.tracing,span_=(span,next_well))
-                if(x+func.tau>tau_horizon):
+
+                if(x is None ) or (x+func.tau>tau_horizon):
+                    #print('x=',x,' tau_horizon=',tau_horizon)
                     k+=1
                     continue
 
@@ -2239,6 +2255,7 @@ class wells_schedule:
                 log.vector[j].val=value
 
             k += 1
+
         if not available:
             self.available_executer[i]=False
 
@@ -2267,7 +2284,7 @@ class wells_schedule:
                 self.weights.swap(i,np.array(ninf,dtype=np.int32))
         if self.log.record:
             self.log.close()
-        return valid
+        return  valid
 
     def get_vector_v1(self, i=0,eps=np.inf):
         cw = self.groups[i]
@@ -3067,10 +3084,17 @@ class wells_schedule:
                 for w in index:
                     fun=self.debit_functions[w]
                     for e in self.numbers[self.available_executer]:
+                        go=True
                         if self.ftmatrix[w,e]:
-                            t=self.ct[e]
-                            if t>fun.supp[1]:
-                                removable.append(w)
+                            cw=self.groups[e]
+                            t = self.solved_time(other=w, current=cw,
+                                                 current_index=e, tracing=self.tracing)
+
+                            if((t is not None) and (t<fun.supp[1])):
+                                go=False
+                                break
+                    if go:
+                        removable.append(w)
                 return removable
             removable=check(index)
             self.opened.remove(removable)
@@ -3286,6 +3310,9 @@ class wells_schedule:
                 self.counters["percent"].append(self.percent)
                 self.counters['time'].append([self.ct.copy(),self.opened_previous])
                 self.added=0
+                #print(self.counter,self.free.shape[0])
+                #if self.counter==47:
+                    #print()
 
                 #print(self.counter,self.free.shape,self.opened_corteges,self.available_executer[self.available_executer].shape)
                 if res is None:
