@@ -559,6 +559,11 @@ class Safty2DArray:
     def __repr__(self):
         return self.array.__repr__()
 
+    def clear(self):
+        self.mask.fill(False)
+        self.infmask.fill(False)
+        self.infindex.fill(0)
+
     def fill(self, *args):
         self.array.fill(*args)
 

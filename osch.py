@@ -53,6 +53,8 @@ class Executor:
         self.injected=False
         self.paused=False
         self.tau_horizon=np.inf
+        self.mintau_horizon=0
+        self.empty=False
     def loc(self,item):
         i=self.indices[item]
         return self.iloc(i)
@@ -71,9 +73,10 @@ class Executor:
     def getitems(self):
         return self.corteges[~self.corteges.mask].data
     def isempty(self):
-        if self.corteges[~self.corteges.mask].shape[0]>0:
-            return False
-        else: return True
+        return self.empty
+        #if self.corteges[~self.corteges.mask].shape[0]>0:
+            #return False
+        #else: return True
 
     def add(self,value):
         n=self.corteges.shape[0]
@@ -118,11 +121,12 @@ class debit_function:
         #self.busy=False
         self.t1=np.NINF
         self.t2=np.NINF
-        self.x1=np.NINF #временные координаты входа/выхода
-        self.x2=np.NINF
+        self.x1=0 #временные координаты входа/выхода
+        self.x2=0
         self.span=np.array([np.NINF,np.inf])
         self.key=None
         self.used=False
+        self.executor=None
         self.usedby=None
         self.prohibits=np.array([],dtype=np.int16)
         self.bounds=dict({})
@@ -133,12 +137,22 @@ class debit_function:
         self.master=True
         self.left_slave=None
         self.right_slave=None
+        self.parent=None
+        self.children=None
+        self.delta_children=0
+        self.kernel_value=0
+        self.applied=0
+        self.time=0
+        self.edelta=0
+        self.blocked=False
+
 
     def reset_cortege(self):
         self.supp=np.array((0,self.t),dtype=np.float32)
         self.cs=False
         self.opened=False
         self.reserved=False
+        self.order=0
         #self.cortege=None
 
     def isbusy(self,x):
@@ -183,6 +197,13 @@ class debit_function:
         self.drift = self.b * self.ro + self.teta * (1 - self.ro)
         if self.dq<0:
             self.ro=0
+    def apply(self,delta,time):
+        if self.parent is not None:
+            if self.time<time:
+                self.time=time
+            if self.edelta<delta:
+                self.edelta=delta
+            self.applied+=1
 
 
 class Engineering:
@@ -255,9 +276,9 @@ class Engineering:
         for c in self.ufields:
             values_= get_unique(field=c)
             self.unique_values.update({c:values_})
-        self.get_corteges()
+        #self.get_corteges()
 
-    def get_corteges(self):
+    def get_corteges(self,available_labels=False):
         def get_pos(corteges_position,corteges_index):
             uniq=np.unique(corteges_index)
             corteges_position_ = np.empty(corteges_position.shape[0])
@@ -279,8 +300,19 @@ class Engineering:
         self.corteges_position=get_pos(corteges_position,self.corteges_index)
         self.activities['native_position']=self.activities['position']
         self.activities['position']=self.corteges_position
-        mask=~self.activities['cortege_activity_id'].isnull()
-        grouped=self.activities[mask].groupby('cortege_activity_id')
+        mask = ~self.activities.loc[:,'cortege_activity_id'].isnull()
+
+        if available_labels:
+            index=self.activity_index[~self.activity_index.mask].data
+            mask_=mask.copy()
+            mask_[:]=False
+            mask_.loc[index]=True
+            mask=mask&mask_
+
+
+        grouped = self.activities[mask].groupby('cortege_activity_id')
+
+
         for k in grouped.groups.keys():
             cortege = Cortege()
             cortege.fit(index=k, labels=grouped.groups[k], data=self.activities)
@@ -1204,10 +1236,13 @@ class wells_schedule:
         self.opened_previous=np.array([])
         self.percent=0
         self.opened=SaftyList()
+        self.kernel=np.array([])
+        self.kernel_mask=np.zeros([],dtype=bool)
+        self.flag=False
 
 
     def fit(self,ts,tr,Q0,Q1,current_places,support=None,queue=dict({}),corteges=dict({}),corteges_index=None,corteges_position=None,wells_allowed=None,groups_allowed=None, tracing=None, permutation=None, epsilon=np.inf,horizon=np.inf,delta=3,stop=None,
-            record=False,shrinkage=1):
+            record=False,shrinkage=1,kernel=np.array([])):
         def update_debit_functions():
             if self.routes is not None:
                 for i in np.arange(self.routes.shape[1]):
@@ -1285,6 +1320,7 @@ class wells_schedule:
         self.log.record=record
         self.corteges=corteges
         self.shrinkage=shrinkage
+        self.kernel=kernel
         if corteges_index is None:
             self.corteges_index=np.empty(self.Q0.shape[0])
             self.corteges_index.fill(np.nan)
@@ -1296,6 +1332,7 @@ class wells_schedule:
             self.corteges_position.fill(np.nan)
         else:
             self.corteges_position=corteges_position
+        self.kernel_mask=np.zeros(self.Q0.shape[0],dtype=bool)
 
 
 
@@ -1420,6 +1457,133 @@ class wells_schedule:
         #self.prohib_dict = self.get_prohib_dict()
         self.counter=self.free.shape[0]
         update_debit_functions()
+        self.set_kernels()
+
+    def get_kernel(self,cortege,ftmatrix,kernel=np.array([])):
+        def iskernel(a):
+            for e in kernel:
+                if ftmatrix[a,e]:
+                    return True
+            return False
+        ker=dict()
+        for i,k in enumerate(cortege.position.keys()):
+            acts=cortege.get_activities(i)
+            for ac in acts:
+                if iskernel(ac):
+                    self.kernel_mask[ac]=True
+                    try:
+                        ker[k].append(ac)
+                    except KeyError:
+                        ker[k]=[]
+                        ker[k].append(ac)
+        return ker
+
+    def set_kernel(self,cortege,ftmatrix,kernel=np.array([]),value=0):
+        def go(index,parent=None,i=0,val=0):
+            if i>=len(index):
+                return
+            key=index[i]
+            acts=ker[key]
+            children=None
+            distance=0
+            if (i+1)<len(index):
+                children=ker[index[i+1]]
+                distance=self.get_activities_distance(acts[0],children[0],cortege,self.tr,self.corteges_index,self.corteges_position)
+
+            for a in acts:
+                fun=self.debit_functions[a]
+                fun.children=children
+                fun.parent=parent
+                fun.kernel_value=val
+                fun.delta_children=distance
+            go(index,acts,i+1,val)
+
+
+
+        ker=self.get_kernel(cortege,ftmatrix,kernel)
+        if len(ker.keys())>0:
+            index_=list(ker.keys())
+            go(index_,None,0,value)
+            return True
+        else:return False
+
+
+    def set_kernels(self):
+        i=0
+        for k in self.corteges.keys():
+            cortege=self.corteges[k]
+            if self.set_kernel(cortege,self.ftmatrix,self.kernel,i):
+                i+=1
+
+    def apply_kernel(self,fun=debit_function()):
+        if fun.children is not None:
+            for c in fun.children:
+                func=self.debit_functions[c]
+                func.apply(fun.delta_children,fun.t2)
+
+    def fit_applied(self,applied):
+        def wrap(cor,ker):
+            start = list(ker.keys())[0]
+            keys = filter(lambda k: k >= start, cor.position.keys())
+            blocked_keys = filter(lambda k: k < start, cor.position.keys())
+            t1 = None
+            t2 = None
+            for k in keys:
+                if cor.position[k].is_done():
+                    t1 = cor.position[k].mint
+                    t2 = cor.position[k].maxt
+                    continue
+                else:
+                    if cor.position[k].applied_number > 0:
+                        bounds = cor.Apply(cor.position[k].mint, cor.position[k].mint, start=k, pass_used=True)
+                        self.set_compact(bounds, cor.position_index)
+                        break
+                    else:
+                        bounds = cor.Apply(t1, t2, start=k, pass_used=True)
+                        self.set_compact(bounds, cor.position_index)
+                        break
+            if (not cor.isopened())&(t1 is not None):
+                bounds = cor.Apply(t1, t2, start=k, pass_used=True)
+                self.set_compact(bounds, cor.position_index)
+
+            for i,bk in enumerate(blocked_keys):
+                activities=cor.get_activities(i)
+                for a in activities:
+                    self.debit_functions[a].blocked=True
+                    applied_activities.append(a)
+
+
+
+        applied_activities=[]
+        for cid in applied.keys():
+            cortege=self.corteges[cid]
+            app=applied[cid]
+            for k in app.keys():
+                b = cortege.apply_in_position(app[k], k)
+                applied_activities.extend(app[k].keys())
+                for f in app[k].keys():
+                    t1=app[k][f][0]
+                    t2 = app[k][f][1]
+                    executor=app[k][f][2]
+                    fun=self.debit_functions[f]
+                    fun.used=True
+                    fun.t1=t1
+                    fun.t2=t2
+                    fun.executor=executor
+            wrap(cortege,app)
+        mask=~np.isin(self.free,applied_activities)
+        self.free=self.free[mask]
+        self.logistic_values = self.logistic_values[mask]
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -1662,17 +1826,25 @@ class wells_schedule:
             execut = cortege[0][1]
             activities = cortege[0][0]
             self.opened.extend(activities)
+            cortege_ = self.corteges[cid]
             weigth = cortege[1]
             t_ = weigth.min() * -1
             mct = self.ct[execut].min()
-            t = max(mct, t_)
-            cortege_=self.corteges[cid]
+            that = max(mct, t_)
+            tvector=self.get_executers_vector(cortege_,self.tr)
+            t=tvector.max()
+            #t=that
+
             if not cortege_.isopened():
                 bounds=cortege_.Apply(t,t)
                 self.set_compact(bounds)
                 self.opened_corteges += 1
                 for e in self.executors.keys():
                     self.executors[e].apply(cid)
+                    ct=self.ct[e]
+                    #if (ct+self.executors[e].epsilon)<t:
+                        #self.executors[e].epsilon=t-ct
+
             i=0
             while i<activities.shape[0]:
                 ac=activities[i]
@@ -1731,16 +1903,75 @@ class wells_schedule:
                 self.executors[k].paused=False
             self.epsilon=np.inf
             self.horizon=val
+        else:
+            for k in self.executors.keys():
+                self.executors[k].epsilon=self.horizon
+
 
 
     def get_weights(self, indices=np.array([0])):
-        def set_tau_horizon(executers):
-            acs = self.get_opened_activities()
-            matrix = self.get_ifapply(executers, acs)
-            for i,e in enumerate(executers):
-                self.executors[e].tau_horizon=matrix[i]
 
+        def set_debit_functions(executors):
+            def set(executers,fun):
+                other = fun.index
+                for e in executers:
+                    if not self.ftmatrix[other,e]:
+                        continue
+                    cw=self.groups[e]
+                    x=self.solved_time(other,cw,e,tracing=True)
+                    if x is None:
+                        continue
+                    xtau=x+fun.tau
+                    if fun.x1>x:
+                        fun.x1=x
+                    if fun.x2<xtau:
+                        fun.x2=xtau
+                return
 
+            if not self.tracing:
+                return
+            for f in self.free:
+                cortege_index = self.corteges_index[f]
+                if np.isnan(cortege_index):
+                    continue
+                fun=self.debit_functions[f]
+                if (fun.blocked)|(not fun.opened):
+                    continue
+                fun.x1=np.inf
+                fun.x2=np.NINF
+                set(executors,fun)
+            return
+
+        def set_tau_horizon(executors):
+            def set_corteges():
+                for cid in self.corteges.keys():
+                    cortege=self.corteges[cid]
+                    if (not cortege.blocked) and cortege.isopened():
+                        cortege.shortest_way(self.debit_functions)
+                return
+            conditions=lambda x: True if (not self.debit_functions[x].blocked)&(not self.debit_functions[x].opened)&(not self.debit_functions[x].used)&self.in_ocortege(x) else False
+            def get_horizon(activities,ct=0):
+                horizons=[]
+                for a in activities:
+                    fun=self.debit_functions[a]
+                    if (fun.x2 is not  None) and (fun.x2>=ct):
+                        horizons.append(fun.x2)
+                return np.array(horizons)
+            if executors.shape[0]>0:
+                set_corteges()
+                available_activities=self.get_available_activities(executors,conditions=conditions)
+                for e in available_activities.keys():
+                    activities=available_activities[e]
+                    if len(activities)==0:
+                        self.executors[e].tau_horizon=np.inf
+                        self.executors[e].empty=True
+                        continue
+                    ct = self.ct[e]
+                    horizons=get_horizon(activities,ct)
+                    if horizons.shape[0]>0:
+                        self.executors[e].tau_horizon=horizons.min()
+                    else:
+                        self.executors[e].tau_horizon=np.inf
 
 
         if self.stop > self.free.shape[0]:
@@ -1748,45 +1979,57 @@ class wells_schedule:
         self.reserved_corteges=dict({})
         self.update_executors()
         self.weights=op.Safty2DArray(shape=(self.groups.shape[0], self.stop))
-        self.weights.fill(np.NINF)
+
         tolerance=self.epsilon
-        set_tau_horizon(indices)
+        #set_tau_horizon(indices)
         step=0
         missed=[]
         #cco=0
         forw=True
-        open_=True
+        open_=self.nempty_corteges()
+        horizon=True
         while forw:
-            set_tau_horizon(indices)
+            self.weights.clear()
+            self.weights.fill(np.NINF)
+            if horizon:
+                set_debit_functions(indices)
+                set_tau_horizon(indices)
+                horizon=False
             #t1=time.perf_counter()
             empty=[]
-            for i in indices:
+            valid_=False
+            for teta,i in enumerate(indices):
                 ct = self.ct[i]
                 if ct - self.minct < tolerance:
-                    eps=self.executors[i].epsilon+step
+                    if (~np.isinf(self.executors[i].tau_horizon)) and (self.executors[i].tau_horizon<self.executors[i].mintau_horizon):
+                        continue
+
+                    if ~np.isinf(self.executors[i].tau_horizon):
+                        eps=np.inf
+                    else:
+                        eps = self.executors[i].epsilon
+
+                    eps+=step
                     valid=True
                     if not self.executors[i].paused:
                         valid=self.get_vector(i,eps=eps)
+                        first=False
+                        if valid:
+                            valid_=True
                     if (self.tracing)&(not valid):
                         empty.append(i)
 
                 else:
                     missed.append(i)
+
             if (len(empty)>0) &(len(self.opened)==0) & open_:
-            #if (len(empty) > 0) & open_:
                 empty_=np.array(empty,dtype=np.int32)
                 open_=self.try2open(empty_)
-                #open_=True
-                #if assigned:
-                    #set_tau_horizon(indices)
-                continue
-
-
+                if open_:
+                    horizon=True
+                    continue
 
             self.nempty = self.weights.index[self.weights.mask]
-            #nem=np.where(~np.isinf(self.weights.array.reshape(-1)))[0].shape[0]
-
-
             if (self.nempty.shape[0]==0)&(not self.empty_executors())&(step<self.t):
                 for k in self.executors.keys():
                     self.executors[i].paused = False
@@ -1982,8 +2225,6 @@ class wells_schedule:
                 weigth.swap(i, ninf)
 
             i+= 1
-        #indices = weigth.mask
-        #weigth_ = weigth.array[indices, :][:, indices]
         return weigth,index
     def assign_corteges(self,executers=np.array([],dtype=np.int32)):
         assigned=dict()
@@ -2032,6 +2273,35 @@ class wells_schedule:
             self.corteges[k].reserved = False
         return covered
 
+    def get_available_executers(self,activities=np.array([],dtype=np.int32)):
+        d = dict()
+        if not hasattr(activities, '__iter__'):
+            activities=[activities]
+
+        for a in activities:
+            d[a] = []
+            for e in self.executors.keys():
+                if self.ftmatrix[a, e]:
+                    d[a].append(e)
+        return d
+
+    def get_available_activities(self, executers=np.array([], dtype=np.int32),conditions=lambda x:True):
+        d = dict()
+        if not hasattr(executers, '__iter__'):
+            executers=[executers]
+
+        for e in executers:
+            d[e] = []
+            #for a in self.debit_functions.keys():
+            for a in self.free:
+                if self.ftmatrix[a, e] & conditions(a):
+                    d[e].append(a)
+        return d
+    def in_ocortege(self,activitie):
+        cortege_name=self.corteges_index[activitie]
+        if np.isnan(cortege_name): return False
+        if self.corteges[cortege_name].isopened()&(not self.corteges[cortege_name].blocked):return True
+        return False
 
 
 
@@ -2074,10 +2344,10 @@ class wells_schedule:
             else:
                 return np.NINF
         return function
-    def get_opened_activities(self):
+    def get_opened_activities_old(self):
         return np.array(self.opened,dtype=np.int32)
 
-    def get_opened_activities_old(self):
+    def get_opened_activities(self):
         opened = []
         for a in self.free:
             fun=self.debit_functions[a]
@@ -2099,10 +2369,10 @@ class wells_schedule:
                 if not self.ftmatrix[a,e]:
                     continue
                 cw=self.groups[e]
-
-                t=self.solved_time(other=a,current=cw,current_index=e,tracing=self.tracing)
+                t=self.solved_time(other=a,current=cw,current_index=e,tracing=True)
                 if t is None:
                     continue
+
                 bounds=cortege.ifapply(a,t,t+tau)
                 if bounds is None:
                     continue
@@ -2110,6 +2380,10 @@ class wells_schedule:
                     time=bounds[k][1]
                     for s,ex in enumerate(executors):
                         if self.ftmatrix[k,ex]:
+                            #cwo=self.groups[ex]
+                            #t_ = self.solved_time(other=k, current=cwo, current_index=ex, tracing=True)
+                            #if t_>time:
+                                #continue
                             if time<matrix[s]:
                                 matrix[s]=time
         return matrix
@@ -2126,11 +2400,12 @@ class wells_schedule:
         k = 0
         inf = True
         # i- индекс бригады
-        span,next_well=self.get_span(i,return_next=True)
-        finit=self.finit(span=span,tolerance=self.tolerance)
+        #span,next_well=self.get_span(i,return_next=True)
+        #finit=self.finit(span=span,tolerance=self.tolerance)
         inspan=False
-        if next_well is not None:
-            inspan=True
+        next_well=None
+        #if next_well is not None:
+            #inspan=True
         cv = np.inf
         dt = 0.
         ck = None
@@ -2142,26 +2417,28 @@ class wells_schedule:
         y=None
         valid=False
         tau_horizon=self.executors[i].tau_horizon
+        executor=self.executors[i]
+        mintau_horizon=np.inf
 
         if self.log.record:
             log=self.log.open(i)
             log.cw=cw
             log.ct=self.ct[i]
-            log.next_well=next_well
+            #log.next_well=next_well
             log.niter=self.counter
-            log.span=span
+            #log.span=span
 
 
         while k < self.stop:
             valid_=False
             j = self.free[k]
-
-            value=self.weights[i, k]
-            if j==next_well:
-                ck=k
             func = self.debit_functions[j]
-            inspan=inspan & (not func.cs)
-            #func=finit(func_)
+
+            if func.blocked:
+                k+=1
+                continue
+            value=self.weights[i, k]
+
             func.current_index = k
             allow = self.ftmatrix[j, i]
             if not allow:
@@ -2187,14 +2464,17 @@ class wells_schedule:
                     continue
 
 
-
-
-
                 x=self.solved_time(other=j,current=cw,
-                                current_index=i,tracing=self.tracing,span_=(span,next_well))
+                                current_index=i,tracing=True,span_=False)
+                if (x is None):
+                    k+=1
+                    continue
+                xtau=x+func.tau
 
-                if(x is None ) or (x+func.tau>tau_horizon):
-                    #print('x=',x,' tau_horizon=',tau_horizon)
+                if mintau_horizon>xtau:
+                    mintau_horizon=xtau
+
+                if xtau>tau_horizon:
                     k+=1
                     continue
 
@@ -2218,33 +2498,25 @@ class wells_schedule:
                 k+=1
                 continue
 
-            if allow & free_:
-                if next_well is not None:
-                    if j == next_well:
-                        value=finit(func,x)
-                        #value=self.fun(x,func)
-                    else:
-                        if (not func.cs)&(y is not None):
-                            value = self.fun(x=x, fun=func)
 
-                        #else:
-                            #value = np.NINF
+            #if next_well is not None:
+                #if j == next_well:
+                    #value=finit(func,x)
+                #else:
+            #if (not func.cs)&(y is not None):
+                #value = self.fun(x=x, fun=func)
 
-                else:
-                    if self.tracing:
-                        penalty = self.penalty(other=j, current=cw,
-                                          current_index=i, func=func)
+           # else:
+            if self.tracing:
+                penalty = self.penalty(other=j, current=cw,
+                                  current_index=i, func=func)
 
-                        value = self.fun(x=x, fun=func,penalty=penalty)
-                    else:
-                        if not func.cs:
-                            value = self.fun(x=x, fun=func)
+                value = self.fun(x=x, fun=func,penalty=penalty)
+            else:
+                #if not func.cs:
+                value = self.fun(x=x, fun=func)
 
-                        #else:
-                            #value = np.NINF
 
-            #else:
-                #value = np.NINF
 
             if ~np.isinf(value):
                 self.weights[i, k] = value
@@ -2258,6 +2530,7 @@ class wells_schedule:
 
         if not available:
             self.available_executer[i]=False
+        executor.mintau_horizon=mintau_horizon
 
         if ~self.weights.mask[i]:
             if (next_well is not None) and (ck is not None):
@@ -2443,7 +2716,7 @@ class wells_schedule:
         x=self.set_bound(y, func)
         x=self.get_group_support(x, current_index)
         penalty=min(y-func.supp[0],0)
-        return penalty
+        return penalty+self.shrinkage*self.debit_functions[other].order
 
     def solved_time(self,other, current, current_index, tracing=False,set_blocked=False,span_=None,return_inspan=False):
         # expected span_=(span,target)
@@ -2545,6 +2818,19 @@ class wells_schedule:
         else:
             y=np.NINF
         return y
+    def cval(self,x=0.,fun=debit_function()):
+        if fun.parent is None:
+            return fun.kernel_value
+        else:
+            if fun.applied<len(fun.parent):
+                return np.NINF
+            else:
+                if x>=fun.time+fun.edelta:
+                    return fun.kernel_value
+                else:
+                    return np.NINF
+
+
 
     def f7(self,x=0.,fun=debit_function()):
         teta=fun.supp[0]-x
@@ -2803,6 +3089,7 @@ class wells_schedule:
         i=0
         while i<self.free.shape[0]:
             cw=self.free[i]
+
             val=value(cw,index)
             if val is not None:
                 if self.logistic_values is None:
@@ -2814,10 +3101,13 @@ class wells_schedule:
             self.support[k,[0,1]]=np.nan
             self.added-=1
             self.localy_added-=1
+            self.opened.remove(k)
             #self.opened_activities.remove(k)
         cortege.reset()
 
-    def set_compact(self,bounds=dict({0:np.array([0,np.inf])})):
+    def set_compact(self,bounds=dict({0:np.array([0,np.inf])}),order=0):
+        if bounds is None:
+            return
         def value(i=0,index=np.array([])):
             sum=0
             for j in index:
@@ -2843,6 +3133,7 @@ class wells_schedule:
             func=self.debit_functions[k]
             func.supp=supp
             func.opened=True
+            func.order=order
             self.support[k,0]=supp[0]
             self.support[k, 1] = supp[1]
             self.added+=1
@@ -2851,6 +3142,7 @@ class wells_schedule:
             #print('opened ',k,supp)
         index=np.array(list(bounds.keys()))
         realise_executors(activities=index)
+        self.update_mintau([],index)
         i=0
         while i<self.free.shape[0]:
             cw=self.free[i]
@@ -2895,22 +3187,11 @@ class wells_schedule:
                     self.executors[e].apply(cortege_name)
             bounds=cortege.Apply(t1,t2,cw)
             if bounds is not None:
-                self.set_compact(bounds)
+                self.set_compact(bounds,cortege.position_index)
             return
 
         except KeyError:
             return
-
-
-
-
-
-
-
-
-
-
-
 
     def optim(self,t):
         s=0
@@ -3076,8 +3357,67 @@ class wells_schedule:
             except KeyError:
                 continue
 
+    def print_traj(self,traj):
+        for i, j in enumerate(traj):
+            if j < 0:
+                continue
+            print(i, j, sep=':', end=' ')
+        print('')
 
+    def update_mintau(self,outcome,income):
+        if not self.tracing:
+            return
+        for e in self.executors.keys():
+            mintau_horizon=self.executors[e].mintau_horizon
+            cw=self.groups[e]
+            continue_=True
+            for other in outcome:
+                if self.ftmatrix[other,e]:
+                    fun=self.debit_functions[other]
+                    x=self.solved_time(other,cw,e,tracing=True)
+                    if x is None:
+                        continue
+                    xtau=x+fun.tau
+                    if xtau<=mintau_horizon:
+                        self.executors[e].mintau_horizon=0
+                        continue_=False
+                        break
+            if not continue_:
+                continue
+            for other in income:
+                if self.ftmatrix[other,e]:
+                    fun=self.debit_functions[other]
+                    x=self.solved_time(other,cw,e,tracing=True)
+                    if x is None:
+                        continue
+                    xtau=x+fun.tau
+                    if xtau<=mintau_horizon:
+                        mintau_horizon=xtau
+            self.executors[e].mintau_horizon=mintau_horizon
+        return
     def update(self,indices=np.array([]),s=0):
+        def mark_as_blocked():
+            for f in self.free:
+                fun=self.debit_functions[f]
+
+                if (not fun.opened)|(fun.blocked):
+                    continue
+                cortege_index = self.corteges_index[f]
+                if ~np.isnan(cortege_index) and self.corteges[cortege_index].blocked:
+                    fun.blocked=True
+                    continue
+                blocked=True
+                for e in self.executors.keys():
+                    if self.ftmatrix[f,e]&self.available_executer[e]:
+                        if self.ct[e]<fun.supp[1]:
+                            blocked=False
+                            break
+                fun.blocked=blocked
+                if ~np.isnan(cortege_index) and blocked:
+                    self.corteges[cortege_index].blocked=blocked
+
+
+
         def check4reset(index):
             def check(index):
                 removable=[]
@@ -3109,6 +3449,7 @@ class wells_schedule:
                 self.reset_compact(cortege)
             return
 
+
         index=self.free[indices[1]]
         self.cd=self.cd+s
         mask=np.zeros(index.shape[0],dtype=bool)
@@ -3128,6 +3469,7 @@ class wells_schedule:
 
         for i,w in enumerate(index):
             j=self.nempty[i]
+
             if self.tracing & self.executors[j].injected:
                 injected+=1
                 continue
@@ -3145,7 +3487,6 @@ class wells_schedule:
             if st is not None:
                 if fun.cs:
                     st=max(st,fun.t1)
-
                 self.st[j] =st
                 self.ct[j] = self.st[j] + self.tr[w]
                 fun.used=True
@@ -3153,8 +3494,12 @@ class wells_schedule:
                 self.source+=1
                 fun.t1=self.st[j]
                 fun.t2=self.ct[j]
-                self.open_compact(w,fun.t1, fun.t2)
-                self.opened.remove(w)
+                fun.executor=j
+                if self.tracing:
+                    self.open_compact(w,fun.t1, fun.t2)
+                    self.opened.remove(w)
+                else:
+                    self.apply_kernel(fun)
                 #bounds=self.open_compact(fun.t1,fun.t2,w)
                 #if bounds is not None:
                     #self.set_compact(bounds)
@@ -3162,7 +3507,8 @@ class wells_schedule:
         # во вторую очередь обходим мероприятия, назначенные принудительно и инициирующие кортеж
 
         if self.tracing:
-         for i,w in enumerate(index):
+
+             for i,w in enumerate(index):
                 j=self.nempty[i]
                 if self.tracing & (not self.executors[j].injected):
                     continue
@@ -3178,7 +3524,6 @@ class wells_schedule:
                 if st is not None:
                     if fun.cs:
                         st=max(st,fun.t1)
-
                     self.st[j] =st
                     self.ct[j] = self.st[j] + self.tr[w]
                     fun.used=True
@@ -3186,6 +3531,8 @@ class wells_schedule:
                     mask[i] = True
                     fun.t1=self.st[j]
                     fun.t2=self.ct[j]
+
+                    fun.executor = j
                     self.open_compact(w,fun.t1, fun.t2)
                     self.opened.remove(w)
                     #print('taken ',w)
@@ -3232,6 +3579,9 @@ class wells_schedule:
         self.maxct=self.ct[self.available_executer].max()
         self.trajectories.append([index_x,(index_y,index_z,index_w)])
         check4reset(self.opened)
+        mark_as_blocked()
+        self.update_mintau(outcome=index,income=[])
+        #self.print_traj(index_x)
 
     def update_schedule(self,index=np.array([])):
         if self.routes is not None:
@@ -3249,6 +3599,137 @@ class wells_schedule:
                             #print()
                         self.current_index[i]=ci+1
                 k+=1
+    def get_corteges_vector(self,cortege,tau_vector):
+        def get_max(position,tau_vector,ahat):
+            maxa = 0
+            for k in position.keys():
+                a = position[k][0]
+                alpha=position[k][2]
+                tau = tau_vector[k]
+                ahat_=a+tau+ahat*alpha
+                if (ahat_) > maxa:
+                    maxa = ahat_
+            return maxa
+
+        #vector=dict()
+        def go(cortege,tau_vector,index=0):
+            position=cortege.get_bounds(index)
+            if index==0:
+                maxa=get_max(position,tau_vector,0)
+                vector[index]=maxa
+                return maxa
+            else:
+                ahat=go(cortege,tau_vector,index-1)
+                maxa=get_max(position,tau_vector,ahat)
+                vector[index]=maxa
+                return maxa
+        i=cortege.count()
+
+        if i<1:
+            return np.array([])
+        vector = np.empty(shape=i)
+        go(cortege,tau_vector,i-1)
+        return vector
+    def get_executers_vector(self,cortege,tau_vector):
+        def get_executers_ct(activities,criterion='mean'):
+            def get_value(vector):
+                if criterion=='mean':
+                    return vector.mean()
+                if criterion=='max':
+                    return vector.max()
+                else:
+                    return vector.min()
+
+            if len(activities)==0:
+                return np.array([])
+            time=np.empty(len(activities))
+            for i,a in enumerate(activities):
+                t=[]
+                for e in self.executors.keys():
+                    if self.ftmatrix[a,e]:
+                        #if self.ct[e]<t:
+                        t.append(self.ct[e])
+                time[i]=get_value(np.array(t))
+            return time
+
+
+        def get_time(position,executers_time):
+            activities=list(position.keys())
+            time=get_executers_ct(activities,'max')
+            return time.max()-executers_time
+
+
+        vector=self.get_corteges_vector(cortege,tau_vector)
+        n=cortege.count()
+        tvector=np.empty(n)
+        i=0
+        etime=0
+
+        while i<n:
+            position=cortege.get_bounds(i)
+            if i>0:
+                etime=vector[i-1]
+            time=get_time(position,etime)
+            tvector[i]=time
+            i+=1
+
+        return tvector
+
+    def get_activities_distance(self,activitie1,activitie2,cortege,tau_vector,corteges_index,corteges_position):
+        def get_distance(a,b,cortege):
+            distance=0
+            start=False
+            for k in cortege.position.keys():
+                if (k!=a)&(not start):
+                    continue
+                if k==a:
+                    start=True
+                if k==b:
+                    return distance
+                acts=list(cortege.position[k].diction.keys())
+                d=tau_vector[acts].max()
+                distance+=d
+            return 0
+        cid1=corteges_index[activitie1]
+        cid2 = corteges_index[activitie2]
+        distance=0
+        if cid1!=cid2:
+            return 0
+        if cid1!=cortege.index:
+            return 0
+        p1=corteges_position[activitie1]
+        p2 = corteges_position[activitie2]
+        if p1==p2:
+            return 0
+        if p1<p2:
+            distance=get_distance(p1,p2,cortege)
+        else:
+            distance = get_distance(p2, p1, cortege)
+
+        return distance
+
+    def get_applied_kernel(self):
+        ci=dict()
+        for cid in self.corteges.keys():
+            cortege=self.corteges[cid]
+            ker=self.get_kernel(cortege,self.ftmatrix,self.kernel)
+            if len(ker.keys())>0:
+                d = dict()
+                for k in ker.keys():
+                    acts = ker[k]
+                    d_ = dict()
+                    for a in acts:
+                        fun = self.debit_functions[a]
+                        if fun.used:
+                            d_[a] = (fun.t1, fun.t2, fun.executor)
+                    d[k] = d_
+                if len(d.keys())>0:
+                    ci[cid]=d
+        return ci
+
+
+
+
 
     def update_queue(self,w=0,i=None):
         queue,current = self.get_queue(w,i)
@@ -3266,6 +3747,12 @@ class wells_schedule:
             return True, current
         else:
             return False,current
+    def nempty_corteges(self):
+        empty=False
+        for cid in self.corteges.keys():
+            if not self.corteges[cid].isopened():
+                return True
+        return empty
 
     def isvalid(self,igroup,well):
         fun=self.debit_functions[well]
@@ -3298,7 +3785,7 @@ class wells_schedule:
         try:
 
             while self.free.shape[0]>0:
-                #self.opened_activities = []
+                self.opened_activities = []
                 res=self.get_optimized_trajectories(self.numbers[self.available_executer])
                 self.counter+=1
                 self.counters["niter"].append(self.counter)
@@ -3310,10 +3797,18 @@ class wells_schedule:
                 self.counters["percent"].append(self.percent)
                 self.counters['time'].append([self.ct.copy(),self.opened_previous])
                 self.added=0
-                #print(self.counter,self.free.shape[0])
-                #if self.counter==47:
-                    #print()
 
+
+                #if self.counter==2:
+                    #self.counter=self.counter
+
+
+                #self.flag=True
+                #if self.flag:
+                    #print(self.counter,self.executors[22].tau_horizon,self.ct[22])
+                print(self.counter,self.free.shape[0])
+                #if self.counter==52:
+                    #self.counter=self.counter
                 #print(self.counter,self.free.shape,self.opened_corteges,self.available_executer[self.available_executer].shape)
                 if res is None:
                     break
@@ -3346,7 +3841,7 @@ class wells_schedule:
                     j+=1
                 i+=1
 
-    def to_date(self,sdate=np.datetime64('2023-01-01'),R=np.array([]),T=np.array([]),D=np.array([])):
+    def to_date_old(self,sdate=np.datetime64('2023-01-01'),R=np.array([]),T=np.array([]),D=np.array([])):
         diction=dict({})
         i=0
         while i<R.shape[1]:
@@ -3374,7 +3869,24 @@ class wells_schedule:
 
             i+=1
         return diction
+    def to_date(self,debit_functions,sdate=np.datetime64('2023-01-01')):
+        diction=dict({})
+        i=0
+        for f in debit_functions.keys():
+            fun=debit_functions[f]
+            if fun.used:
+                t1=fun.t1
+                t2=fun.t2
+                q0=fun.q0
+                q1=fun.q1
+                t1_=dts(t1)
+                t2_=dts(t2)
+                i=fun.executor
+                sd=sdate+pd.DateOffset(seconds=t1_)
+                ed = sdate + pd.DateOffset(seconds=t2_)
+                diction[f]=dict({'exec':i,"begin":sd,"end":ed,"q0":q0,"q1":q1})
 
+        return diction
 
 
 
@@ -3789,13 +4301,18 @@ class ListItems:
     def get_count(self):
         return len(self.diction)
 
-    def set_bounds(self,x=0,xtau=0):
+    def set_bounds(self,x=0,xtau=0,pass_used=True):
         assert (x <= xtau), "left bound must be less or equal than right one "
         res=dict()
         for key in self.diction.keys():
             item=self.diction[key]
-            item.set_bounds(x=x,xtau=xtau)
-            res.update({key:np.array([item.t1,item.t2])})
+            if pass_used:
+                if item.used:
+                    continue
+
+            item.set_bounds(x=x, xtau=xtau)
+            res.update({key: np.array([item.t1, item.t2])})
+            res.update({key: np.array([item.t1, item.t2])})
         return res
 
     def get_bounds(self,x=0,xtau=0):
@@ -3831,6 +4348,7 @@ class Cortege:
         self.n=0
         self.reserved=False
         self.confirm=False
+        self.blocked=False
 
     def val(self,t):
         return (t-self.dTausum)*self.dQsum
@@ -3845,6 +4363,7 @@ class Cortege:
     def insert(self,key=0,val=ListItems()):
         assert isinstance(val,ListItems)
         self.position[key]=val
+
     def fit(self,index=0,labels=np.array([],dtype=np.int32),data=pd.DataFrame([])):
         self.index=index
         val = data.loc[labels,['Q1','Q0','duration']].values
@@ -3865,9 +4384,9 @@ class Cortege:
             self.position[int(key)]=Li
             self.iloc[iloc]=int(key)
 
-    def Apply(self,x=0,xtau=0,cw=None):
+    def Apply(self,x=0,xtau=0,cw=None,start=0,pass_used=False):
         if  cw is None:
-            self.queue=self.get_position()
+            self.queue=self.get_position(start=start,pass_used=pass_used)
             self.queue(x,xtau)
             return self.bounds
         else:
@@ -3878,18 +4397,40 @@ class Cortege:
                 return self.bounds
             else:
                 return None
+    def apply_in_position(self,bounds,position_index,pass_used=True):
+        bounds_=None
+        for k in bounds.keys():
+            x0=bounds[k][0]
+            xtau=bounds[k][1]
+            bounds_=self.position[position_index].apply(k,x0,xtau)
+        if bounds_ is None:
+            t=self.position[position_index].mint
+            bounds_=self.position[position_index].set_bounds(t,t,pass_used=pass_used)
+        return bounds_
 
-    def get_position(self):
-        mapped = map(lambda x: self.position[x], self.position.keys())
+    def get_position(self,start=0,pass_used=False):
+        for i,k in enumerate(self.position.keys()):
+            if k==start:
+                break
+        mapped = map(lambda x: self.position[x], filter(lambda y: y>=start,self.position.keys()))
+        self.position_index=i-1
         def value(x=0,xtau=0):
-            try:
-                fun=next(mapped)
-                self.position_index+=1
-                self.bounds=fun.set_bounds(x=x,xtau=xtau)
-                self.current=fun
-                #return fun
-            except StopIteration:
-                self.bounds=None
+            done=True
+            while done:
+                try:
+                    fun=next(mapped)
+                    done=fun.is_done()
+                    self.position_index+=1
+                    if done:
+                        x=fun.mint
+                        xtau=fun.maxt
+                    else:
+                        self.bounds=fun.set_bounds(x=x,xtau=xtau,pass_used=pass_used)
+                    self.current=fun
+
+                except StopIteration:
+                    self.bounds=None
+                    done=False
         return value
     def count(self):
         return len(self.position)
@@ -3911,7 +4452,7 @@ class Cortege:
                 init()
                 key = self.iloc[iloc]
             for k in self.position[key].diction.keys():
-                res[k]=(self.position[key].diction[k].a,self.position[key].diction[k].b)
+                res[k]=(self.position[key].diction[k].a,self.position[key].diction[k].b,self.position[key].diction[k].alpha)
 
             return res
         except KeyError:
@@ -3952,8 +4493,61 @@ class Cortege:
         else:
             return None
 
+    def shortest_way(self,debit_functions):
+        def begin(debit_functions):
+            activities=self.get_activities(self.position_index)
+            t1 = position.mint
+            t2 = position.maxt
 
+            for a in activities:
+                fun=debit_functions[a]
+                if fun.used|fun.blocked:
+                    continue
+                x=fun.x1
+                xtau=fun.x2
+                if x<t1:
+                    t1=x
+                if xtau> t2:
+                    t2=xtau
+                #supp=fun.supp
+                #if supp[0]<t1:
+                    #t1=supp[0]
+                #if (supp[0]+fun.tau)>t2:
+                    #t2=supp[0]+fun.tau
+                #fun.x1=fun.supp[0]
+                #fun.x2 = fun.x1+fun.tau
+            return t1,t2
+        def shortest(t1_,t2_,position,debit_functions):
+            t1=position.mint
+            t2=position.maxt
+            bounds = position.get_bounds(t1_, t2_)
+            for k in bounds.keys():
+                fun=debit_functions[k]
+                b=bounds[k]
+                if fun.used:
+                    continue
+                if b[0]<t1:
+                    t1=b[0]
+                if b[0]+fun.tau>t2:
+                    t2=b[0]+fun.tau
+                fun.x1=b[0]
+                fun.x2=fun.x1+fun.tau
+            return t1,t2
 
+        i=self.position_index
+        key = self.iloc[i]
+        position = self.position[key]
+        #вычисляем границы закрытия текущей очереди кортежа
+        t1,t2=begin(debit_functions)
+        j=i+1
+        while j<self.count():
+            key=self.iloc[j]
+            position=self.position[key]
+            t1_,t2_=shortest(t1,t2,position,debit_functions)
+            t1=t1_
+            t2=t2_
+            j+=1
+        return
 
 
 

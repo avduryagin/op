@@ -74,7 +74,8 @@ class Session:
         sql=sql.format(Field, wells_id)
         return pd.read_sql(sql,self.session)
 
-    def update(self,data=pd.DataFrame(columns=['id','executor','exec_begin','exec_end']),plan_id=343043,file='update.sql'):
+    def update(self,data=pd.DataFrame(columns=['id','executor','exec_begin','exec_end']),plan_id=343043,file='update.sql',record=False):
+        missed=[]
 
         mask=~data['executor'].isnull()
         cursor=self.session.cursor()
@@ -89,6 +90,8 @@ class Session:
             sql = sql.format(id=activity, execid=executor,sdate=sdate,edate=edate,plan=plan_id,distributed=1)
             #self.sql=sql
             cursor.execute(sql)
+            if (cursor.statusmessage!='UPDATE 1')& record:
+                missed.append(activity)
         self.session.commit()
         return True
 
