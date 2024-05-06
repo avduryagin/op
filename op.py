@@ -637,6 +637,134 @@ class Safty2DArray:
         return False
 
 
+class OrderedMap(list):
+    def __init__(self):
+        super().__init__()
+        self.loc_=dict()
+        self.shape=[0]
+    def add(self,key,val):
+        def ins(i0,i1):
+            n=(i1-i0)+1
+            if n<2:
+                f0=self.__getitem__(i0)
+                v0=self.loc_[f0]
+
+                if val<=v0:
+                    self.insert(i0,key)
+                else:
+                    self.insert(i1+1,key)
+                return
+            k=int(n/2)-1
+            f0 = self.__getitem__(i0)
+            v0 = self.loc_[f0]
+            f1 = self.__getitem__(i1)
+            v1 = self.loc_[f1]
+            if val<v0:
+                self.insert(i0,key)
+                return
+            if val>v1:
+                self.insert(i1+1, key)
+                return
+
+            teta=i0+k
+            fk = self.__getitem__(teta)
+            vk = self.loc_[fk]
+            if (val<=vk)&(val>=v0):
+                ins(i0,teta)
+            else:
+                ins(teta+1, i1)
+        if self.loc_.get(key) is not None:
+            return
+
+        self.loc_[key] = val
+        self.shape[0] += 1
+        n=len(self)
+        if n==0:
+            self.append(key)
+            return
+        i0=0
+        i1=n-1
+        ins(i0,i1)
+        return
+
+    def loc(self,key):
+        return self.loc_[key]
+
+    def delete(self,key_):
+        try:
+            del self.loc_[key_]
+            super().remove(key_)
+            self.shape[0] -= 1
+        except IndexError:
+            pass
+        except KeyError:
+            pass
+        return
+    def remove(self, key) -> None:
+        if hasattr(key,'__iter__'):
+            for k in key:
+                self.delete(k)
+        else:
+            self.delete(key)
+    def __delitem__(self, i):
+        key=self.__getitem__(i)
+        del self.loc_[key]
+        super().__delitem__(i)
+        self.shape[0] -= 1
+    def __getitem__(self, index):
+        if hasattr(index,'__iter__'):
+            values=[self[x] for x in index]
+            return np.array(values,dtype=np.int32)
+        else:
+            return super().__getitem__(index)
+
+class Indexed2DArray:
+    def __init__(self,shape=(1,1)):
+        assert (isinstance(shape,tuple) or isinstance(shape,int)),"shape must be a tuple or integer"
+        if isinstance(shape,tuple):
+            self.shape=shape
+        if isinstance(shape,int):
+            self.shape=(shape,1)
+        self.array=np.empty(shape=shape)
+        self.array.fill(np.nan)
+        self.set_index(np.arange(self.shape[0]))
+
+    def set_index(self,index=np.array([])):
+        assert index.shape[0]==self.shape[0],"index size must be equal to shape"
+        self.index={k:i for i,k, in enumerate(index)}
+
+    def __getitem__(self, item):
+        try:
+            a=item[0]
+            b=item[1]
+            i=self.index[a]
+            j=self.index[b]
+            return self.array[i,j]
+        except KeyError:
+            return None
+    def __setitem__(self, key, value):
+        try:
+            a=key[0]
+            b=key[1]
+            i=self.index[a]
+            j=self.index[b]
+            self.array[i,j]=value
+        except KeyError:
+            return
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

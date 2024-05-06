@@ -105,6 +105,7 @@ class debit_function:
         self.b=self.teta-self.dq*self.t
         self.sign=hev(self.dq)
         self.ro=1
+        self.lvalue=0
         self.supp=np.array((0,self.t),dtype=np.float32)
         #self.cs -compact support
         self.cs=False
@@ -112,7 +113,14 @@ class debit_function:
         self.reserved=False
         self.index=0
         self.current_index = 0
+        self.cortege_previous=None
+        self.cortege_next=None
         self.cortege=None
+        self.cortege_a=0
+        self.cortege_b = 0
+        self.cortege_alpha=0
+        self.cortege_delta=0
+        self.next=None
         self.order=0
         self.gamma=10
         self.epsilon=tau
@@ -127,6 +135,8 @@ class debit_function:
         self.key=None
         self.used=False
         self.executor=None
+        self.sh_previous=None
+        self.sh_next=None
         self.usedby=None
         self.prohibits=np.array([],dtype=np.int16)
         self.bounds=dict({})
@@ -134,7 +144,7 @@ class debit_function:
             self.ro=0
         self.drift=self.b*self.ro+self.teta*(1-self.ro)
         self.dt=0
-        self.master=True
+        self.master=False
         self.left_slave=None
         self.right_slave=None
         self.parent=None
@@ -145,6 +155,7 @@ class debit_function:
         self.time=0
         self.edelta=0
         self.blocked=False
+        self.atype=None
 
 
     def reset_cortege(self):
@@ -204,6 +215,13 @@ class debit_function:
             if self.edelta<delta:
                 self.edelta=delta
             self.applied+=1
+    def solve_bounds(self,t1,t2):
+        t=t1*(1-self.cortege_alpha)+t2*self.cortege_alpha
+        s1=t+self.cortege_a
+        s2=t+self.cortege_b
+        return s1,s2
+
+
 
 
 class Engineering:
@@ -1171,7 +1189,8 @@ class wells_schedule:
     def __init__(self):
         self.trajectories=[]
         #self.wells=np.array([])#номера скважин
-        self.free=np.array([]) #номера скважин
+        self.free_all=np.array([]) #номера скважин
+        self.free=op.OrderedMap() #номера скважин в упорядоченном по значению списке
         self.unical = np.array([]) #уникальные номера скважин
         self.cd=0 #текущее значение дебита (current_debit)
         self.groups=np.array([])#начальное распределение бригад по скважинам
@@ -1262,8 +1281,8 @@ class wells_schedule:
 
         def set_initial_time():
             if self.used is not None:
-                mask = ~np.isin(self.free, self.groups[self.used])
-                self.free = self.free[mask]
+                mask = ~np.isin(self.free_all, self.groups[self.used])
+                self.free_all = self.free_all[mask]
                 ext = support[self.groups[self.used], 0]
                 submask = np.isnan(ext)
                 ext[submask] = 0
@@ -1285,7 +1304,7 @@ class wells_schedule:
             val=np.nanmin(self.corteges_position)
 
             mask=self.corteges_position==val
-            activities=self.free[mask]
+            activities=self.free_all[mask]
 
             for a in activities:
                 i=0
@@ -1340,7 +1359,7 @@ class wells_schedule:
         self.tr=tr
         self.tolerance=1e-3
         self.delta=delta
-        self.free=np.arange(Q0.shape[0])
+        self.free_all=np.arange(Q0.shape[0])
 
         self.mask=np.ones(Q0.shape[0],dtype=bool)
         self.cd=0
@@ -1366,7 +1385,7 @@ class wells_schedule:
         self.current_indey = np.arange(self.groups.shape[0])#координата в столбце self.routes
         self.numbers = np.arange(self.groups.shape[0])
         #устанавливаем начальное время для бригад на скважинах
-        set_initial_time()
+        #set_initial_time()
         init_executors()
 
 
@@ -1396,7 +1415,7 @@ class wells_schedule:
         minsc=np.inf
         supported=[]
 
-        for i in self.free:
+        for i in self.free_all:
             supp=self.support[i]
             cortege_index=self.corteges_index[i]
             wf=debit_function(self.Q0[i],self.Q1[i],self.tr[i],self.t)
@@ -1444,10 +1463,10 @@ class wells_schedule:
         self.supported=np.array(supported)
         mask=~np.isnan(self.values)
         self.values=self.values[mask]
-        self.sindices=np.argsort(self.values)
-        if not self.tracing:
-            self.sindices=reverse(self.sindices)
-        self.free=self.free[self.sindices]
+        #self.sindices=np.argsort(self.values)
+        #if not self.tracing:
+            #self.sindices=reverse(self.sindices)
+        #self.free=self.free[self.sindices]
         self.available_activities = np.zeros(self.stop, dtype=bool)
         self.infmask=np.zeros(shape=self.stop,dtype=bool)
         self.infindex = np.zeros(shape=self.stop, dtype=np.int32)
@@ -1455,9 +1474,24 @@ class wells_schedule:
         self.maxcs=maxsc
         self.mincs=minsc
         #self.prohib_dict = self.get_prohib_dict()
-        self.counter=self.free.shape[0]
+        self.counter=self.free_all.shape[0]
         update_debit_functions()
         self.set_kernels()
+    def uniform_corteges(self,corteges,dt=1):
+        t=0
+        for cid in corteges:
+            cor=self.corteges[cid]
+            bounds = cor.Apply(t, t, start=0, pass_used=True)
+            self.set_compact(bounds, 0)
+            t+=dt
+    def uniform_corteges_fit(self,corteges):
+        for cid in corteges.keys():
+            t=corteges[cid]
+            cor=self.corteges[cid]
+            bounds = cor.Apply(t, t, start=0, pass_used=True)
+            self.set_compact(bounds, 0)
+
+
 
     def get_kernel(self,cortege,ftmatrix,kernel=np.array([])):
         def iskernel(a):
@@ -1520,6 +1554,17 @@ class wells_schedule:
             for c in fun.children:
                 func=self.debit_functions[c]
                 func.apply(fun.delta_children,fun.t2)
+    def fit_free(self,free):
+        condition=lambda x:x.supp[1] if self.tracing else x.scaled_v1(0)
+        for a in free:
+            fun=self.debit_functions[a]
+            if ((not fun.opened)&(self.tracing))|fun.blocked:
+                continue
+            val=condition(fun)
+            if self.tracing:
+                self.add_logistic_value(a)
+            else:
+                self.free.add(a,val)
 
     def fit_applied(self,applied):
         def wrap(cor,ker):
@@ -1550,6 +1595,7 @@ class wells_schedule:
                 activities=cor.get_activities(i)
                 for a in activities:
                     self.debit_functions[a].blocked=True
+                    self.debit_functions[a].left_slave=True
                     applied_activities.append(a)
 
 
@@ -1571,21 +1617,10 @@ class wells_schedule:
                     fun.t2=t2
                     fun.executor=executor
             wrap(cortege,app)
-        mask=~np.isin(self.free,applied_activities)
-        self.free=self.free[mask]
-        self.logistic_values = self.logistic_values[mask]
-
-
-
-
-
-
-
-
-
-
-
-
+        #self.remove_logistic_value(applied_activities)
+        #mask=~np.isin(self.free,applied_activities)
+        #self.free=self.free[mask]
+        #self.logistic_values = self.logistic_values[mask]
 
     def fit_v1(self,ts,tr,Q0,Q1,groups,support=None,used=None,stop=None,queue=dict({}),epsilon=np.inf,service=np.array([]),equipment=np.array([]),wells_service=None,wells_equipment=None,prohibits=None,delta=3.,group_support=None,tracing=None):
         def update_df():
@@ -1816,10 +1851,9 @@ class wells_schedule:
 
 
     def try2open(self,executers=np.array([],dtype=np.int32)):
-        assigned=False
         cover=self.cover(executers)
-        if len(cover.keys())==0:
-            return False
+        #if len(cover.keys())==0:
+            #return cover.keys()
 
         for cid in cover.keys():
             cortege=cover[cid]
@@ -1852,9 +1886,8 @@ class wells_schedule:
                 self.executors[e].injected=True
                 #set_value(ac,e)
                 i+=1
-        if len(cover.keys())>0:
-            assigned=True
-        return assigned
+
+        return cover.keys()
 
 
 
@@ -1903,6 +1936,7 @@ class wells_schedule:
                 self.executors[k].paused=False
             self.epsilon=np.inf
             self.horizon=val
+            self.stop=self.free.shape[0]
         else:
             for k in self.executors.keys():
                 self.executors[k].epsilon=self.horizon
@@ -1942,14 +1976,19 @@ class wells_schedule:
                 set(executors,fun)
             return
 
-        def set_tau_horizon(executors):
-            def set_corteges():
-                for cid in self.corteges.keys():
+        def set_tau_horizon(executors,corteges=None):
+            def set_corteges(corteges=None):
+                if corteges is None:
+                    corteges=self.corteges.keys()
+                for cid in corteges:
                     cortege=self.corteges[cid]
-                    if (not cortege.blocked) and cortege.isopened():
+                    if (cortege.reserved) and (not cortege.blocked) and cortege.isopened():
                         cortege.shortest_way(self.debit_functions)
+                        cortege.reserved=False
                 return
-            conditions=lambda x: True if (not self.debit_functions[x].blocked)&(not self.debit_functions[x].opened)&(not self.debit_functions[x].used)&self.in_ocortege(x) else False
+
+            conditions = lambda x: False if self.debit_functions[x].used or self.debit_functions[x].opened or self.debit_functions[x].blocked or (not self.in_ocortege(x)) else True
+            #conditions=lambda x: True if (not self.debit_functions[x].blocked)&(not self.debit_functions[x].opened)&(not self.debit_functions[x].used)&self.in_ocortege(x) else False
             def get_horizon(activities,ct=0):
                 horizons=[]
                 for a in activities:
@@ -1957,21 +1996,47 @@ class wells_schedule:
                     if (fun.x2 is not  None) and (fun.x2>=ct):
                         horizons.append(fun.x2)
                 return np.array(horizons)
+
             if executors.shape[0]>0:
-                set_corteges()
-                available_activities=self.get_available_activities(executors,conditions=conditions)
-                for e in available_activities.keys():
-                    activities=available_activities[e]
-                    if len(activities)==0:
-                        self.executors[e].tau_horizon=np.inf
-                        self.executors[e].empty=True
-                        continue
+                t1_ = time.perf_counter()
+                set_corteges(corteges)
+                t2_ = time.perf_counter()
+                self.counters['elapse_cort'].append(t2_ - t1_)
+                t1_ = time.perf_counter()
+                #available_activities=self.get_available_activities(executors,conditions=conditions)
+
+                for e in executors:
+                    #if self.executors[e].empty:
+                        #continue
                     ct = self.ct[e]
-                    horizons=get_horizon(activities,ct)
-                    if horizons.shape[0]>0:
-                        self.executors[e].tau_horizon=horizons.min()
-                    else:
-                        self.executors[e].tau_horizon=np.inf
+                    horizon=np.inf
+                    available=False
+                    for f in self.free_all:
+                        if (not self.ftmatrix[f,e]) or (not conditions(f)):
+                            continue
+                        fun = self.debit_functions[f]
+                        if (fun.x2 is not None) and (fun.x2 >= ct):
+                            available=True
+                            if fun.x2<horizon:
+                                horizon=fun.x2
+                    self.executors[e].tau_horizon=horizon
+                    if not available:
+                        self.executors[e].empty = True
+                t2_ = time.perf_counter()
+                self.counters['elapse_act'].append(t2_ - t1_)
+
+                #for e in available_activities.keys():
+                    #activities=available_activities[e]
+                    #if len(activities)==0:
+                        #self.executors[e].tau_horizon=np.inf
+                        #self.executors[e].empty=True
+                        #continue
+                    #ct = self.ct[e]
+                    #horizons=get_horizon(activities,ct)
+                    #if horizons.shape[0]>0:
+                        #self.executors[e].tau_horizon=horizons.min()
+                    #else:
+                        #self.executors[e].tau_horizon=np.inf
 
 
         if self.stop > self.free.shape[0]:
@@ -1986,23 +2051,29 @@ class wells_schedule:
         missed=[]
         #cco=0
         forw=True
-        open_=self.nempty_corteges()
-        horizon=True
+        open_=False
+        #open_=self.nempty_corteges()
+        horizon=not self.empty_executors()
         while forw:
             self.weights.clear()
             self.weights.fill(np.NINF)
             if horizon:
                 set_debit_functions(indices)
+                t1_ = time.perf_counter()
                 set_tau_horizon(indices)
+                t2_ = time.perf_counter()
+                self.counters['elapse_horizon'].append(t2_ - t1_)
+
                 horizon=False
             #t1=time.perf_counter()
             empty=[]
             valid_=False
+            t1 = time.perf_counter()
             for teta,i in enumerate(indices):
                 ct = self.ct[i]
                 if ct - self.minct < tolerance:
-                    if (~np.isinf(self.executors[i].tau_horizon)) and (self.executors[i].tau_horizon<self.executors[i].mintau_horizon):
-                        continue
+                    #if (~np.isinf(self.executors[i].tau_horizon)) and (self.executors[i].tau_horizon<self.executors[i].mintau_horizon):
+                        #continue
 
                     if ~np.isinf(self.executors[i].tau_horizon):
                         eps=np.inf
@@ -2021,13 +2092,17 @@ class wells_schedule:
 
                 else:
                     missed.append(i)
+            t2 = time.perf_counter()
+            self.counters['elapse_weight'].append(t2-t1)
 
             if (len(empty)>0) &(len(self.opened)==0) & open_:
                 empty_=np.array(empty,dtype=np.int32)
-                open_=self.try2open(empty_)
-                if open_:
+                new_corteges=self.try2open(empty_)
+                if len(new_corteges)>0:
                     horizon=True
                     continue
+                else:
+                    open_=False
 
             self.nempty = self.weights.index[self.weights.mask]
             if (self.nempty.shape[0]==0)&(not self.empty_executors())&(step<self.t):
@@ -2269,8 +2344,8 @@ class wells_schedule:
                 go=False
                 break
             #covered_.extend(covered)
-        for k in self.corteges.keys():
-            self.corteges[k].reserved = False
+        #for k in self.corteges.keys():
+            #self.corteges[k].reserved = False
         return covered
 
     def get_available_executers(self,activities=np.array([],dtype=np.int32)):
@@ -2293,7 +2368,7 @@ class wells_schedule:
         for e in executers:
             d[e] = []
             #for a in self.debit_functions.keys():
-            for a in self.free:
+            for a in self.free_all:
                 if self.ftmatrix[a, e] & conditions(a):
                     d[e].append(a)
         return d
@@ -2433,7 +2508,6 @@ class wells_schedule:
             valid_=False
             j = self.free[k]
             func = self.debit_functions[j]
-
             if func.blocked:
                 k+=1
                 continue
@@ -2480,7 +2554,7 @@ class wells_schedule:
 
             else:
                 z=self.solved_time(other=j,current=cw,
-                                current_index=i,tracing=self.tracing,span_=(span,next_well),return_inspan=inspan)
+                                current_index=i,tracing=self.tracing,return_inspan=inspan)
                 if inspan:
                     x=z[0]
                     y=z[1]
@@ -2528,8 +2602,8 @@ class wells_schedule:
 
             k += 1
 
-        if not available:
-            self.available_executer[i]=False
+        #if not available:
+            #self.available_executer[i]=False
         executor.mintau_horizon=mintau_horizon
 
         if ~self.weights.mask[i]:
@@ -2994,12 +3068,24 @@ class wells_schedule:
                 return -(t+self.logistic_values[cw]/n)
             else:
                 return -t
-
     def f18c(self,x=0.,fun=debit_function(),penalty=0):
+        if (not fun.opened)|(not op.isin2(x,fun.supp,epsilon=self.tolerance))|np.isinf(x):
+            return np.NINF
+
+        t = x + fun.tau-penalty
+        n=self.free.shape[0]-1
+
+        if n>0:
+            return -(t+fun.lvalue/n)
+        else:
+            return -t
+    def f18c_old(self,x=0.,fun=debit_function(),penalty=0):
         #ранжирование по логистике
         # i - номер группы
         def get_value(fun=debit_function()):
             sum=0
+            #if not fun.opened:
+                #return sum
             k=0
             cw=fun.index
             while k<self.free.shape[0]:
@@ -3069,7 +3155,46 @@ class wells_schedule:
         self.logistic_values=self.logistic_values[mask]
         self.opened_count-=indices.shape[0]
 
-    def reset_compact(self,cortege):
+    def add_logistic_value(self,member_):
+        def add(member):
+            fun=self.debit_functions[member]
+            val=fun.supp[1]
+            value=0
+            for f in self.free:
+                func=self.debit_functions[f]
+                ts=self.ts[member,f]
+                v=ts-func.supp[1]
+                value+=v
+                func.lvalue+=(ts-val)
+            fun.lvalue=value
+            self.free.add(member,val)
+            return
+
+        if hasattr(member_, '__iter__'):
+            for m in member_:
+                add(m)
+        else:
+            add(member_)
+    def remove_logistic_value(self,member_):
+        def remove(member):
+            fun=self.debit_functions[member]
+            fun.lvalue = 0
+            val=fun.supp[1]
+            self.free.remove(member)
+            for f in self.free:
+                func=self.debit_functions[f]
+                ts=self.ts[member,f]
+                func.lvalue-=(ts-val)
+
+            return
+        if hasattr(member_,'__iter__'):
+            for m in member_:
+                remove(m)
+        else:
+            remove(member_)
+
+
+    def reset_compact_old(self,cortege):
         def value(i=0,index=np.array([])):
             sum=0
             for j in index:
@@ -3104,8 +3229,26 @@ class wells_schedule:
             self.opened.remove(k)
             #self.opened_activities.remove(k)
         cortege.reset()
+    def reset_compact(self,cortege):
 
-    def set_compact(self,bounds=dict({0:np.array([0,np.inf])}),order=0):
+        if not (type(cortege)==Cortege):
+            return
+        if not cortege.isopened():
+            return
+
+        bounds=cortege.bounds
+        index = np.array(list(bounds.keys()))
+        self.opened_count -= index.shape[0]
+        for k in bounds.keys():
+            self.debit_functions[k].reset_cortege()
+            self.support[k,[0,1]]=np.nan
+            self.added-=1
+            self.localy_added-=1
+            self.opened.remove(k)
+            self.remove_logistic_value(k)
+            #self.opened_activities.remove(k)
+        cortege.reset()
+    def set_compact_old(self,bounds=dict({0:np.array([0,np.inf])}),order=0):
         if bounds is None:
             return
         def value(i=0,index=np.array([])):
@@ -3136,6 +3279,8 @@ class wells_schedule:
             func.order=order
             self.support[k,0]=supp[0]
             self.support[k, 1] = supp[1]
+            #self.orfree.add(k,supp[1])
+            self.add_logistic_value(k)
             self.added+=1
             self.localy_added+=1
             self.opened_activities.append(k)
@@ -3150,30 +3295,48 @@ class wells_schedule:
             if val is not None:
                 if self.logistic_values is None:
                     y=self.fun(x=0,fun=self.debit_functions[cw])
+                print(val,self.logistic_values[i])
                 self.logistic_values[i]+=val
             i+=1
         self.opened_count+=index.shape[0]
+    def set_compact(self,bounds=dict({0:np.array([0,np.inf])}),order=0):
+        if bounds is None:
+            return
+        def realise_executors(activities=np.array([],dtype=np.int32)):
+            i=0
+            while i<self.ftmatrix.shape[1]:
+                if self.executors[i].paused:
+                    for a in activities:
+                        if self.ftmatrix[a,i]:
+                            self.executors[i].paused=False
+                            break
+                i+=1
 
-    def open_compact_old(self,cw=0,t1=0,t2=0):
-        try:
-            cortege_name=self.corteges_index[cw]
 
-            cortege=self.corteges[cortege_name]
-            if not cortege.isopened():
-                cortege.apply = cortege.get_position()
-                cortege.apply(t1, t1)
-                self.set_compact(cortege.bounds)
-                self.opened_corteges+=1
-                for e in self.executors.keys():
-                    self.executors[e].apply(cortege_name)
+        for k in bounds.keys():
+            if (k==1640)|(k==444)|(k==1069):
+                k=k
+            supp=bounds[k]
+            func=self.debit_functions[k]
+            func.supp=supp
+            func.opened=True
+            func.order=order
+            cor=func.cortege
+            self.corteges[cor].reserved=True
+            self.support[k,0]=supp[0]
+            self.support[k, 1] = supp[1]
+            #self.orfree.add(k,supp[1])
+            self.add_logistic_value(k)
+            self.added+=1
+            self.localy_added+=1
+            self.opened_activities.append(k)
+            #print('opened ',k,supp)
+        index=np.array(list(bounds.keys()))
+        realise_executors(activities=index)
+        self.update_mintau([],index)
+        self.opened_count+=index.shape[0]
 
-            bounds=cortege.current.apply(cw,t1,t2)
-            if bounds is not None:
-                cortege.apply(bounds[0], bounds[1])
-                return cortege.bounds
 
-        except KeyError:
-            return None
 
     def open_compact(self,cw=0,t1=0,t2=0):
         try:
@@ -3398,7 +3561,7 @@ class wells_schedule:
     def update(self,indices=np.array([]),s=0):
         def mark_as_blocked():
             for f in self.free:
-                fun=self.debit_functions[f]
+                fun = self.debit_functions[f]
 
                 if (not fun.opened)|(fun.blocked):
                     continue
@@ -3413,6 +3576,7 @@ class wells_schedule:
                             blocked=False
                             break
                 fun.blocked=blocked
+
                 if ~np.isnan(cortege_index) and blocked:
                     self.corteges[cortege_index].blocked=blocked
 
@@ -3423,6 +3587,9 @@ class wells_schedule:
                 removable=[]
                 for w in index:
                     fun=self.debit_functions[w]
+                    if fun.blocked:
+                        removable.append(w)
+                        continue
                     for e in self.numbers[self.available_executer]:
                         go=True
                         if self.ftmatrix[w,e]:
@@ -3500,9 +3667,7 @@ class wells_schedule:
                     self.opened.remove(w)
                 else:
                     self.apply_kernel(fun)
-                #bounds=self.open_compact(fun.t1,fun.t2,w)
-                #if bounds is not None:
-                    #self.set_compact(bounds)
+
 
         # во вторую очередь обходим мероприятия, назначенные принудительно и инициирующие кортеж
 
@@ -3535,25 +3700,16 @@ class wells_schedule:
                     fun.executor = j
                     self.open_compact(w,fun.t1, fun.t2)
                     self.opened.remove(w)
-                    #print('taken ',w)
-                    #bounds=self.open_compact(w,fun.t1,fun.t2)
-                    #if bounds is not None:
-                        #self.set_compact(bounds)
+
 
 
 
         index_y[:]=self.st
         index_z[:]=self.ct
-        #index_y=self.st.copy()
-        #index_z=self.ct.copy()
-        #index_x=index[self.nempty]
-
-
 
         assert mask[mask==True].shape[0]>0,"No one activities has been taken!"
 
         index=index[mask]
-        #print('recorded=',index.shape[0])
         opened=np.array(self.opened_activities,dtype=np.int32)
         self.percent=0
         if self.opened_previous.shape[0]>0:
@@ -3565,14 +3721,18 @@ class wells_schedule:
         self.opened_activities=[]
         self.nempty=self.nempty[mask]
         indices=indices[:,mask]
-        self.update_schedule(index=index)
-        self.update_logistic_values(indices=index)
+        #self.update_schedule(index=index)
+        #self.update_logistic_values(indices=index)
         index_x[self.nempty] = index
         self.groups[self.nempty]=index
-        self.mask=np.ones(self.free.shape[0],dtype=bool)
-        self.mask[indices[1]]=False
-        self.free=self.free[self.mask]
-        self.available_activities=np.zeros(shape=self.stop,dtype=bool)
+        if not self.tracing:
+            self.free.remove(index)
+        else:
+            self.remove_logistic_value(index)
+        #self.mask=np.ones(self.free.shape[0],dtype=bool)
+        #self.mask[indices[1]]=False
+        #self.free=self.free[self.mask]
+        #self.available_activities=np.zeros(shape=self.stop,dtype=bool)
         self.infmask = np.zeros(shape=self.stop, dtype=bool)
         self.infindex = np.zeros(shape=self.stop, dtype=np.int32)
         self.minct = self.ct[self.available_executer].min()
@@ -3580,7 +3740,7 @@ class wells_schedule:
         self.trajectories.append([index_x,(index_y,index_z,index_w)])
         check4reset(self.opened)
         mark_as_blocked()
-        self.update_mintau(outcome=index,income=[])
+        #self.update_mintau(outcome=index,income=[])
         #self.print_traj(index_x)
 
     def update_schedule(self,index=np.array([])):
@@ -3780,13 +3940,15 @@ class wells_schedule:
 
     def get_routes(self):
         self.counter=0
-        self.counters.update({"niter":[],"free":[],"opened":[],"executers":[],"opened_act":[],
-                              "added":[],"percent":[],"time":[]})
+        self.counters.update({"niter":[],"free":[],"take":[],"opened":[],"executers":[],"opened_act":[],
+                              "added":[],"percent":[],"time":[],"elapse":[],"elapse_weight":[],"elapse_horizon":[],"elapse_act":[],"elapse_cort":[]})
         try:
 
             while self.free.shape[0]>0:
                 self.opened_activities = []
+                t1=time.perf_counter()
                 res=self.get_optimized_trajectories(self.numbers[self.available_executer])
+                t2 = time.perf_counter()
                 self.counter+=1
                 self.counters["niter"].append(self.counter)
                 self.counters["free"].append(self.free.shape[0])
@@ -3797,16 +3959,21 @@ class wells_schedule:
                 self.counters["percent"].append(self.percent)
                 self.counters['time'].append([self.ct.copy(),self.opened_previous])
                 self.added=0
+                self.counters['elapse'].append(t2-t1)
+                if res is None:
+                    self.counters["take"].append(0)
+                else:
+                    self.counters["take"].append(res[0].shape[1])
 
 
-                #if self.counter==2:
+                #if self.counter==63:
                     #self.counter=self.counter
 
 
                 #self.flag=True
                 #if self.flag:
                     #print(self.counter,self.executors[22].tau_horizon,self.ct[22])
-                print(self.counter,self.free.shape[0])
+                #print(self.counter,self.free.shape[0])
                 #if self.counter==52:
                     #self.counter=self.counter
                 #print(self.counter,self.free.shape,self.opened_corteges,self.available_executer[self.available_executer].shape)
@@ -4787,126 +4954,3 @@ class Events:
 
 
 
-
-#from importlib import reload
-#used=np.load(path+'task\\used.npy')
-#support=np.load(path+'task\\support.npy')
-#group=np.load(path+'task\\groups.npy')
-#Q0=np.load(path+'task\\Q0.npy')
-#Q1=np.load(path+'task\\Q1.npy')
-#tr=np.load(path+'task\\tr.npy')
-#ts1=np.load(path+'task\\ts.npy')
-#pairs=np.load(path+'pairs.npy')
-#reload(optim)
-#index=[234,325,326]
-#tr[index]=5.
-#Q0[index]=10.
-#Q1[index]=15.
-#queue=np.load(path+'task\\queue.npy',allow_pickle=True)[()]
-#support=np.empty(shape=(Q0.shape[0],2))
-#support.fill(np.nan)
-
-#service=np.load(path+'service.npy')
-#equipment=np.load(path+'equipment.npy')
-#wells_service=np.load(path+'wells_service.npy',allow_pickle=True)
-#wells_equipment=np.load(path+'wells_equipment.npy',allow_pickle=True)
-
-#R=np.load(path+'task\\R.npy')
-#T=np.load(path+'task\\T.npy')
-#D=np.load(path+'task\\D.npy')
-
-#wsch=wells_schedule()
-#wsch.t=360
-#wsch.tracing=True
-#wsch.fun=wsch.f14
-#stop=Q0.shape[0]
-#wsch.routes=R
-#wsch.start=D
-#wsch.end=T
-#wsch.function=optim.get_optim_trajectory
-#epsilon=tr.mean()
-#epsilon=np.inf
-#wsch.fit(ts1,tr,Q0,Q1,group,support=support,used=used,stop=stop,epsilon=epsilon,service=service,equipment=equipment,wells_service=wells_service,wells_equipment=wells_equipment,prohibits=pairs)
-
-#mask=np.isin(wsch.free,wsch.supported)
-#wsch.free=wsch.free[mask]
-
-#trace=wsch.get_routes()
-#R_,T_,D_,O_=get_rout_time(trace)
-#print()
-#wsch.stop=group.shape[0]
-#wsch.fun=wsch.f6
-#wsch.routes=R
-#wsch.start=D
-#wsch.end=T
-
-#Q0=np.array([1,1.5,0.5,1,1,1])
-#Q1=np.array([10,5,1,np.NINF,np.NINF,np.NINF])
-#tr1=np.ones(Q0.shape[0])
-#ts1=np.zeros(shape=(Q0.shape[0],Q0.shape[0]))
-#n=ts1.shape[0]
-#for i in np.arange(ts1.shape[0]):
-   # k=i+1
-   # while k<ts1.shape[0]:
-        #ts1[i,k]=n-k
-        #ts1[k, i] = n-k
-        #k+=1
-#support=np.array([[1.5,2],[1,2],[1,1.5]])
-#support=None
-#tr1=np.array([0.1,0.1,0.5])
-#groups=np.array([0,1,2,3],dtype=int)
-#ts1=np.array([[0,1,1],[1,0,1],[1,1,0]])/10
-#t=tr1.sum()
-#wsch=wells_schedule()
-#wsch.t=10
-#wsch.fit(ts1,tr1,Q0,Q1,groups,support=support)
-#wsch.weights=np.array([[1,2,3,np.NINF,np.NINF,np.NINF],[3,2,1,np.NINF,np.NINF,np.NINF],[np.NINF,2,1,np.NINF,np.NINF,np.NINF]])
-#wsch.infindex=np.array([0,1,2,0,0,0],dtype=np.int32)
-#wsch.infmask=np.array([1,1,1,0,0,0],dtype=bool)
-#v=np.array([5,5,5,np.NINF,np.NINF,np.NINF])
-#wsch.vector=np.array([1,1,1,0,0,0],dtype=bool)
-#wsch.check_infty(v,4)
-#print('')
-#wsch.fun=wsch.f6
-#wsch.stop=6
-#trace=wsch.get_routes_v1(tracing=False)
-#R,T,D=get_rout_time(trace)
-#print(R)
-
-
-#subpath=path+'task\\otm\\'
-#otm_Q0=np.load(subpath+'Q0.npy')
-#otm_Q1=np.load(subpath+'Q1.npy')
-#otm_distances=np.load(subpath+'ts.npy')
-#otm_group=np.load(subpath+'groups.npy')
-#otm_support=np.load(subpath+'support.npy')
-#service=np.load(subpath+'service.npy')
-#equipment=np.load(subpath+'equipment.npy')
-#otm_service=np.load(subpath+'well_service.npy',allow_pickle=True)
-#otm_tr=np.load(subpath+'tr.npy')
-#prohibits=np.load(subpath+'otm_binary.npy')
-#expanded=np.load(subpath+'expanded.npy',allow_pickle=True)[()]
-#otm_group_support=np.array([[0,24],[9,19],[0,24]])/24
-
-#wsch=wells_schedule()
-#wsch.t=360
-#wsch.tracing=True
-#stop=otm_Q0.shape[0]
-#wsch.fun=wsch.f14
-#wsch.fit(otm_distances,otm_tr,otm_Q0,otm_Q1,otm_group,support=otm_support,tracing=True,stop=stop,epsilon=np.inf,service=service, equipment=equipment,wells_service=otm_service,prohibits=prohibits,group_support=otm_group_support)
-#wsch.fit(otm_distances,otm_tr,otm_Q0,otm_Q1,otm_group,support=otm_support,stop=stop,epsilon=np.inf,service=service, equipment=equipment,wells_service=otm_service,prohibits=prohibits,group_support=otm_group_support)
-#wsch.update_debit_functions(expanded)
-#mask=np.isin(wsch.free,wsch.supported)
-#wsch.free=wsch.free[mask]
-#t1=wsch.get_group_support(0.2,1)
-#t2=wsch.get_group_support(0.8,1)
-#trace=wsch.get_routes_v1(tracing=True)
-#trace=wsch.get_routes()
-#R,T,D,O=get_rout_time(trace)
-#print('not used '+str(wsch.free.shape[0]))
-#otm_service=np.load(subpath+'otm_service.npy',allow_pickle=True)
-#otm_wells=np.load(subpath+'otm_wells.npy',allow_pickle=True)
-#wells=pd.Index(np.load(subpath+'wells.npy',allow_pickle=True))
-#wells_service=np.load(subpath+'wells_service.npy',allow_pickle=True)
-#otm_prohibits=np.load(subpath+'otm_prohibits.npy',allow_pickle=True)
-#binary=get_otm_binary(otm_wells,otm_service,wells,wells_service,otm_prohibits)

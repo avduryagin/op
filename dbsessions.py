@@ -4,8 +4,8 @@ import os
 
 class Session:
     def __init__(self,host= "vps-pgsql01.asuproject.ru",
-                 dbname = "oisp_160_dev",user = "ufam_oisp_160",
-                 password = "ufam_oisp_160",port = 5432):
+                 dbname = "oisp_160_qas",user = "ufam_oisp_160_dev",
+                 password = "ufam_oisp_160_dev",port = 5432):
         self.host = host
         self.dbname = dbname
         self.user = user
@@ -17,9 +17,10 @@ class Session:
         self.auth="select PSBS_SECURE.SetContext('root', cast (NOW() as TIMESTAMP), cast (NOW() as TIMESTAMP), '6766', 67)"
 
 
-    def open(self):
+    def open(self,autocommit=False):
         self.session=ps.connect(host=self.host,dbname=self.dbname,
                                 user=self.user,password=self.password)
+        self.session.autocommit=autocommit
         auth=pd.read_sql(self.auth,self.session)
     def wrap(self,tup=tuple()):
         if tup is None:
@@ -75,9 +76,10 @@ class Session:
         return pd.read_sql(sql,self.session)
 
     def update(self,data=pd.DataFrame(columns=['id','executor','exec_begin','exec_end']),plan_id=343043,file='update.sql',record=False):
-        missed=[]
 
+        missed=[]
         mask=~data['executor'].isnull()
+        activities=tuple(data.loc[mask,'id'].values)
         cursor=self.session.cursor()
         for index in data.loc[mask].index:
             executor=data.at[index,'executor']
@@ -92,8 +94,17 @@ class Session:
             cursor.execute(sql)
             if (cursor.statusmessage!='UPDATE 1')& record:
                 missed.append(activity)
+        with open(os.path.join(self.path, "reset_sf_activity.sql"), "r", encoding='utf8') as f:
+            sql = str(f.read())
+        f.close()
+        sql = sql.format(activity_id=self.wrap(activities))
+        cursor.execute(sql)
         self.session.commit()
-        return True
+        cursor.close()
+        self.session.close()
+        if len(missed)>0:
+            return False,missed
+        return True,[]
 
     def reset(self, data=(), plan_id=343043,
                file='reset.sql'):
