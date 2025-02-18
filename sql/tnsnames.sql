@@ -1,0 +1,11 @@
+ORA11=
+  (DESCRIPTION=
+    (ADDRESS=
+      (PROTOCOL=TCP)
+      (HOST=192.168.0.97)
+      (PORT=1521)
+    )
+    (CONNECT_DATA=
+      (SID=ORA11)
+    )
+  )
