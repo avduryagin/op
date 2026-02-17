@@ -80,9 +80,9 @@ class Features:
             return weights
         def scale_var(indices):
             mintau=np.inf
-            maxtau=np.NINF
+            maxtau=-np.inf
             mindelta=np.inf
-            maxdelta=np.NINF
+            maxdelta=-np.inf
             for k in indices:
                 fun=solution.debit_functions[k]
                 tau=fun.tau
@@ -118,7 +118,7 @@ class Features:
             L = get_vec(k,taumin_scale=taumin_scale_,taumax_scale=taumax_scale_,deltamin_scale=deltamin_scale_,deltamax_scale=deltamax_scale_)
             vec[k] = L
         # вычисляем максимальную длину кортежа
-        nmax = np.NINF
+        nmax = -np.inf
         for k in vec.keys():
             s = len(vec[k])
             if s > nmax:

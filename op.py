@@ -431,7 +431,7 @@ class GapMetrics:
 
     def linear(self, x):
         if (x > self.b) | (x < self.origin):
-            return np.NINF
+            return -np.inf
         if (x <= self.a)&(x>=self.origin):
             return self.a-x
         if (x > self.a) & (x <= self.b):
@@ -440,7 +440,7 @@ class GapMetrics:
     def lin(self,x):
         value=x-self.a
         if (value>self.b)|(x>self.b):
-            value= np.NINF
+            value= -np.inf
         return value
 
     def fihat(self,x):
@@ -483,7 +483,7 @@ class GapMetrics:
             fun = eta(a=self.a, b=self.b)
             return fun(x)
         else:
-            return np.NINF
+            return -np.inf
 
 
     def ksihat(self,x):
@@ -526,7 +526,7 @@ class GapMetrics:
             fun = eta(a=self.a, b=self.b)
             return fun(x)
         else:
-            return np.NINF
+            return -np.inf
 
 class Safty2DArray:
     def __init__(self, *args, **kwargs):

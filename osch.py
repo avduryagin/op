@@ -127,11 +127,11 @@ class debit_function:
         self.service=np.array([],dtype=np.int32)
         self.equipment = np.array([], dtype=np.int32)
         #self.busy=False
-        self.t1=np.NINF
-        self.t2=np.NINF
+        self.t1=-np.inf
+        self.t2=-np.inf
         self.x1=0 #временные координаты входа/выхода
         self.x2=0
-        self.span=np.array([np.NINF,np.inf])
+        self.span=np.array([-np.inf,np.inf])
         self.key=None
         self.used=False
         self.executor=None
@@ -184,7 +184,7 @@ class debit_function:
             y=(x-a)/(b-x)
             return w+(1./np.exp(-self.gamma*y**2))-1
         elif x>b:
-            return np.NINF
+            return -np.inf
         else:
             return self.scaled_v1(x)
 
@@ -1046,6 +1046,14 @@ class ListedDicts:
             return self.value
         except KeyError:
             return self.value
+            
+    def get_boolean_array(self,dtype=np.uint8):
+        array=np.zeros(shape=self.shape,dtype=dtype)
+        for i in np.arange(self.shape[0]):
+            for j in np.arange(self.shape[1]):
+                if self[i,j]:
+                    array[i,j]=1
+        return array
 
 
 class RMListedDicts(ListedDicts):
@@ -1115,11 +1123,11 @@ class RMListedDicts_py(ListedDicts):
 
 class values:
     def __init__(self):
-        self.value=np.NINF
+        self.value=-np.inf
         self.index=0
         self.inf=False
-        self.t1=np.NINF
-        self.t2=np.NINF
+        self.t1=-np.inf
+        self.t2=-np.inf
 
 class well_record:
     def __init__(self):
@@ -1401,7 +1409,7 @@ class wells_schedule:
         else:
             self.stop=self.Q0.shape[0]
 
-        self.maxcs=np.NINF
+        self.maxcs=-np.inf
         self.mincs=np.inf
         self.supported=np.array([])
         self.support = support
@@ -1411,7 +1419,7 @@ class wells_schedule:
 
         #init_corteges()
 
-        maxsc=np.NINF
+        maxsc=-np.inf
         minsc=np.inf
         supported=[]
 
@@ -1428,7 +1436,7 @@ class wells_schedule:
                 proht=self.prohibits[i]
                 wf.prohibits=np.where(proht==False)[0]
                 for p in wf.prohibits:
-                    wf.bounds.update({p:np.array([np.NINF,np.NINF])})
+                    wf.bounds.update({p:np.array([-np.inf,-np.inf])})
 
 
             mask=np.isnan(supp)
@@ -1692,7 +1700,7 @@ class wells_schedule:
             self.stop=stop
         else:
             self.stop=self.Q0.shape[0]
-        self.maxcs=np.NINF
+        self.maxcs=-np.inf
         self.mincs=np.inf
         self.supported=np.array([])
         self.support = support
@@ -1700,7 +1708,7 @@ class wells_schedule:
             self.support=np.empty(shape=(self.Q0.shape[0],2))
             self.support.fill(np.nan)
 
-        maxsc=np.NINF
+        maxsc=-np.inf
         minsc=np.inf
         supported=[]
 
@@ -1712,7 +1720,7 @@ class wells_schedule:
                 proht=self.prohibits[i]
                 wf.prohibits=np.where(proht==False)[0]
                 for p in wf.prohibits:
-                    wf.bounds.update({p:np.array([np.NINF,np.NINF])})
+                    wf.bounds.update({p:np.array([-np.inf,-np.inf])})
 
             if self.wells_equipment is not None:
                 wf.equipment=self.wells_equipment[i]
@@ -1972,7 +1980,7 @@ class wells_schedule:
                 if (fun.blocked)|(not fun.opened):
                     continue
                 fun.x1=np.inf
-                fun.x2=np.NINF
+                fun.x2=-np.inf
                 set(executors,fun)
             return
 
@@ -2056,7 +2064,7 @@ class wells_schedule:
         horizon=not self.empty_executors()
         while forw:
             self.weights.clear()
-            self.weights.fill(np.NINF)
+            self.weights.fill(-np.inf)
             if horizon:
                 set_debit_functions(indices)
                 t1_ = time.perf_counter()
@@ -2158,9 +2166,9 @@ class wells_schedule:
                 fun1 = self.debit_functions[well]
                 return np.array([fun1.t1,fun1.supp[1]])
             else:
-                return np.array([np.NINF, np.inf])
+                return np.array([-np.inf, np.inf])
 
-        span = np.array([np.NINF, np.inf]).reshape(-1, 2)
+        span = np.array([-np.inf, np.inf]).reshape(-1, 2)
         target = None
         next_target=None
         try:
@@ -2213,7 +2221,7 @@ class wells_schedule:
         weigth=op.Safty2DArray(shape=(index.shape[0],index.shape[0]))
         #mask=np.zeros(index.shape[0],dtype=bool)
         #notinf=np.zeros(index.shape[0],dtype=np.int16)
-        weigth.fill(np.NINF)
+        weigth.fill(-np.inf)
         #weigth.fill(np.inf)
 
         i_=0
@@ -2272,7 +2280,7 @@ class wells_schedule:
 
         weigth = op.Safty2DArray(shape=(index.shape[0], executers.shape[0]))
 
-        weigth.fill(np.NINF)
+        weigth.fill(-np.inf)
         i = 0
         while i < index.shape[0]:
             activity=index[i]
@@ -2385,13 +2393,13 @@ class wells_schedule:
         if self.routes is None:
             return np.inf,np.inf
         if i >= self.routes.shape[1]:
-            return np.NINF, np.inf
+            return -np.inf, np.inf
 
         target = self.routes[ci, i]
 
 
         if target<0:
-            return np.NINF, np.inf
+            return -np.inf, np.inf
 
         t1 = self.start[ci, i]
         t2 = self.end[ci, i]
@@ -2417,7 +2425,7 @@ class wells_schedule:
             if op.inset(x,span,epsilon=tolerance):
                 return self.fun(x=x,fun=fun)
             else:
-                return np.NINF
+                return -np.inf
         return function
     def get_opened_activities_old(self):
         return np.array(self.opened,dtype=np.int32)
@@ -2682,7 +2690,7 @@ class wells_schedule:
             if self.tracing:
                 if allow & func.opened &(self.ct[i]<=func.supp[0]):
                     if self.ct[i] + eps < func.supp[0]:
-                        self.weights[i, k] = np.NINF
+                        self.weights[i, k] = -np.inf
                         k+=1
                         continue
                     else: valid = True
@@ -2721,7 +2729,7 @@ class wells_schedule:
                             value = self.fun(x=x, fun=func)
 
                         else:
-                            value = np.NINF
+                            value = -np.inf
 
                 else:
                     if self.tracing:
@@ -2734,10 +2742,10 @@ class wells_schedule:
                             value = self.fun(x=x, fun=func)
 
                         else:
-                            value = np.NINF
+                            value = -np.inf
 
             else:
-                value = np.NINF
+                value = -np.inf
 
             if ~np.isinf(value):
                 ninf.append(k)
@@ -2883,26 +2891,26 @@ class wells_schedule:
         if (x>=fun.supp[0])&(x<=fun.supp[1]):
             y=fun.dq*(self.t-fun.tau-x)
         else:
-            y=np.NINF
+            y=-np.inf
         return y
     def f15(self,x=0.,fun=debit_function()):
         # ранжирование по дебиту
         if (x>=fun.supp[0])&(x<=fun.supp[1]):
             return fun.tail(x)
         else:
-            y=np.NINF
+            y=-np.inf
         return y
     def cval(self,x=0.,fun=debit_function()):
         if fun.parent is None:
             return fun.kernel_value
         else:
             if fun.applied<len(fun.parent):
-                return np.NINF
+                return -np.inf
             else:
                 if x>=fun.time+fun.edelta:
                     return fun.kernel_value
                 else:
-                    return np.NINF
+                    return -np.inf
 
 
 
@@ -2915,7 +2923,7 @@ class wells_schedule:
             if teta<=fun.supp[1]:
                 return -teta
             else:
-                return np.NINF
+                return -np.inf
 
     def set_bound(self,x=0.,fun=debit_function()):
         teta=fun.supp[0]-x
@@ -2933,7 +2941,7 @@ class wells_schedule:
         if teta>=0:
             return -teta
         else:
-            return np.NINF
+            return -np.inf
 
     def f9(self,x=0.,fun=debit_function()):
         teta=-self.f7(x,fun=fun)
@@ -2954,7 +2962,7 @@ class wells_schedule:
     def f12(self,x=0.,fun=debit_function()):
         teta=-self.f7(x,fun=fun)
         if teta>fun.supp[1]:
-            return np.NINF
+            return -np.inf
         d=teta+(fun.supp[1]-teta)/fun.tau
         return -d
 
@@ -2963,7 +2971,7 @@ class wells_schedule:
         # i - номер группы
         teta=-self.f7(x,fun=fun)
         if np.isinf(teta):
-            return np.NINF
+            return -np.inf
         #teta=self.get_group_support(teta,i)
         cw=fun.index
         t=teta+fun.tau
@@ -3020,7 +3028,7 @@ class wells_schedule:
             #teta = self.set_bound(x, fun=fun)
             #teta=x
             if np.isinf(x):
-                return np.NINF
+                return -np.inf
             cw = fun.current_index
             t = x + fun.tau
             n=self.free.shape[0]-1
@@ -3060,7 +3068,7 @@ class wells_schedule:
             #teta = self.set_bound(x, fun=fun)
             #teta=x
             if np.isinf(x):
-                return np.NINF
+                return -np.inf
             cw = fun.current_index
             t = x + fun.tau-penalty
             n=self.free.shape[0]-1
@@ -3070,7 +3078,7 @@ class wells_schedule:
                 return -t
     def f18c(self,x=0.,fun=debit_function(),penalty=0):
         if (not fun.opened)|(not op.isin2(x,fun.supp,epsilon=self.tolerance))|np.isinf(x):
-            return np.NINF
+            return -np.inf
 
         t = x + fun.tau-penalty
         n=self.free.shape[0]-1
@@ -3113,7 +3121,7 @@ class wells_schedule:
         else:
 
             if (not fun.opened)|(not op.isin2(x,fun.supp,epsilon=self.tolerance))|np.isinf(x):
-                return np.NINF
+                return -np.inf
             cw = fun.current_index
             t = x + fun.tau-penalty
             n=self.opened_count-1
@@ -3122,6 +3130,9 @@ class wells_schedule:
                 return -(t+self.logistic_values[cw]/n)
             else:
                 return -t
+    def constant_func(*args,**kwargs):        
+        return 0.
+    
     def update_logistic_values(self, indices=np.array([]),incoming=dict()):
         def get_values(i=0,indices=np.array([])):
             sum=0
@@ -4343,7 +4354,7 @@ def set_cathegory(x,columns=np.array([])):
 def set_loc_index(index=np.array([]), R=np.array([]), T=np.array([]), D=np.array([])):
     i = 0
     res = np.empty(shape=(index.shape[0], 2))
-    res.fill(np.NINF)
+    res.fill(-np.inf)
     while i < R.shape[1]:
         j = 0
         while j < R.shape[0]:
@@ -4407,7 +4418,7 @@ class ListItems:
         self.current_index=0
         self.applied_number=0
         self.mint=np.inf
-        self.maxt=np.NINF
+        self.maxt=-np.inf
 
     def insert(self,item=Item()):
         assert isinstance(item,Item),"allowed only Item type"

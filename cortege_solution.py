@@ -149,9 +149,9 @@ class recursion_solution:
 
     def lval(self,x=0.,fun=osch.debit_function(),penalty=0):
         #if (not fun.opened)|np.isinf(x):
-            #return np.NINF
+            #return -np.inf
         if np.isinf(x):
-            return np.NINF
+            return -np.inf
         t = x + fun.tau-penalty
         n=self.free.shape[0]-1
 
@@ -275,7 +275,7 @@ class recursion_solution:
                 k+=1
 
         self.weights=op.Safty2DArray(shape=(self.executors.shape(),self.free.shape[0]))
-        self.weights.fill(np.NINF)
+        self.weights.fill(-np.inf)
 
         for e in self.executors.keys():
             set_values(e)
@@ -588,6 +588,17 @@ class recursion_solution:
                 return teta1, teta2
             return None
 
+        def get_bounds_(span,space,tau):
+            if tau>space[1]-space[0]:
+                return np.array([])
+            def intersection(a, b):
+                if (a[0] > b[1]) | (b[0] > a[1]):
+                    return np.array([])
+                return np.array([max(a[0], b[0]), min(a[1], b[1])])
+            tarr=np.array([space[0],space[1]-tau])
+            bounds=intersection(tarr,span)
+            return bounds
+
 
         def go(index,t0=0,t1=0,htau=0):
             if index is None:
@@ -618,6 +629,7 @@ class recursion_solution:
                 hs2=min(s1,space[1])
                 #hs2=space[1]
                 bounds = get_bounds(t, t + tau, hs1, hs2)
+                #new_bounds=get_bounds_(np.array([s0,s1]),space,tau)
                 if bounds is None:
                     continue
 
